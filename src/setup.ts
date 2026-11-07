@@ -413,7 +413,7 @@ export async function update(opts: { dryRun?: boolean } = {}): Promise<void> {
       return;
     }
     say(`vibemachine ${packageVersion}${newest ? ` → ${newest}` : ""}`);
-    step("npm", ["install", "-g", "vibemachine@latest", "--no-fund", "--no-audit"], os.homedir());
+    step("npm", ["install", "-g", "vibemachine-daemon@latest", "--no-fund", "--no-audit"], os.homedir());
   } else {
     step("git", ["pull", "--ff-only"]);
     step("npm", ["install", "--no-fund", "--no-audit"]);
@@ -456,6 +456,6 @@ export function uninstall(opts: { purge?: boolean; dryRun?: boolean } = {}): voi
     say(`  \`${cliName} uninstall --purge\` deletes it too.`);
   }
   say(`\nThe phone's pairing ends with the daemon; in the app, Settings → Forget this Mac.`);
-  if (installKind() === "package") say(`To remove the command itself: npm uninstall -g vibemachine`);
+  if (installKind() === "package") say(`To remove the command itself: npm uninstall -g vibemachine-daemon`);
   say(`Claude Code and its own sessions (~/.claude) are untouched.`);
 }

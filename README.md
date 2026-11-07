@@ -26,7 +26,7 @@ sponsored by Anthropic. Claude and Claude Code are trademarks of Anthropic.
 ## Install
 
 ```bash
-npm install -g vibemachine
+npm install -g vibemachine-daemon
 vibemachine setup
 ```
 
