@@ -1,0 +1,3 @@
+#!/bin/sh
+# Drive the Vibe Machine daemon from the Mac: see src/cli.ts.
+exec node --import tsx "$(dirname "$0")/../src/cli.ts" "$@"

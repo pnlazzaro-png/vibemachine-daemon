@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Take turns on the simulator. There is one iPhone Duo simulator on the Mac, and every session that
+installs, launches, screenshots or records on it would land in the middle of another's, so whoever
+drives it holds the lease first.
+
+  sim claim [--wait SECONDS] [--label TEXT]   take it (waiting your turn, 15 minutes at most); prints the holder
+  sim release [--force]                       give it back (--force: whoever holds it)
+  sim status                                  who holds it
+  sim hook                                    Claude Code's PreToolUse hook (.claude/settings.json): reads the
+                                              tool call on stdin; a Bash command that drives the simulator takes
+                                              the lease for its session, or waits for it, or is held back
+
+The holder is a process: a session's `claude` (found up the process tree, or $CLAUDE_PID), or the
+daemon (`--pid`). The lease frees itself when that process ends, or when it goes unused for ten
+minutes (each simulator command its holder runs through the hook renews it); the daemon also gives a
+session's lease back when the session's turn ends. The lease is a JSON file in DATA_DIR, read and
+written under an flock, so two claims can't both win.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DATA_DIR = Path(os.environ.get("DATA_DIR", "~/Library/Application Support/VibeMachine")).expanduser()
+LEASE = DATA_DIR / "simulator-lease.json"
+MUTEX = DATA_DIR / "simulator-lease.lock"
+IDLE_S = 10 * 60
+WAIT_S = 15 * 60
+HOOK_WAIT_S = 90
+POLL_S = 2
+
+# simctl's subcommands that only read; every other one drives the simulator.
+READ_ONLY = {"list", "bootstatus", "get_app_container", "listapps", "appinfo", "getenv", "help"}
+SIMCTL = re.compile(r"\bsimctl\b")
+WORD = re.compile(r"[A-Za-z_]+")
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def session_pid() -> int:
+    """This session's `claude` process: $CLAUDE_PID, else the nearest ancestor named claude, else our parent."""
+    env = os.environ.get("CLAUDE_PID", "")
+    if env.isdigit() and alive(int(env)):
+        return int(env)
+    pid = os.getppid()
+    while pid > 1:
+        out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        if not out:
+            break
+        ppid, comm = out.split(None, 1)
+        if os.path.basename(comm) == "claude":
+            return pid
+        pid = int(ppid)
+    return os.getppid()
+
+
+def describe(lease: dict) -> str:
+    since = time.strftime("%H:%M:%S", time.localtime(lease["since"]))
+    return f"{lease.get('label') or 'pid ' + str(lease['pid'])} (pid {lease['pid']}, since {since})"
+
+
+class Lease:
+    """The lease file, under the mutex."""
+
+    def __enter__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self.fd = open(MUTEX, "a")
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        try:
+            self.held = json.loads(LEASE.read_text())
+        except (FileNotFoundError, ValueError):
+            self.held = None
+        if self.held and (not alive(self.held["pid"]) or time.time() - self.held["renewed"] > self.held.get("idle", IDLE_S)):
+            self.held = None
+        return self
+
+    def write(self, lease):
+        if lease is None:
+            LEASE.unlink(missing_ok=True)
+        else:
+            LEASE.write_text(json.dumps(lease))
+        self.held = lease
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        self.fd.close()
+
+
+def try_claim(pid: int, label: str, idle: int):
+    """Take or renew the lease; returns None if we hold it, else who does."""
+    with Lease() as l:
+        now = time.time()
+        if l.held is None:
+            l.write({"pid": pid, "label": label, "since": now, "renewed": now, "idle": idle})
+            return None
+        if l.held["pid"] == pid:
+            l.write({**l.held, "renewed": now, "label": label or l.held.get("label", "")})
+            return None
+        return l.held
+
+
+def claim(pid: int, label: str, wait: float, idle: int, quiet: bool = False):
+    deadline = time.time() + wait
+    said = False
+    while True:
+        holder = try_claim(pid, label, idle)
+        if holder is None:
+            return None
+        if time.time() >= deadline:
+            return holder
+        if not said and not quiet:
+            print(f"The simulator is in use by {describe(holder)}; waiting for it…", file=sys.stderr, flush=True)
+            said = True
+        time.sleep(POLL_S)
+
+
+def release(pid: int, force: bool) -> bool:
+    with Lease() as l:
+        if l.held and (force or l.held["pid"] == pid):
+            l.write(None)
+            return True
+        return False
+
+
+def drives_simulator(command: str) -> bool:
+    """Whether any simctl in the command (a shell line, or a script's argument list) does more than read."""
+    for m in SIMCTL.finditer(command):
+        # The words after this simctl, up to the end of its command: `io booted screenshot`, or a
+        # Python list's "io", "booted", "recordVideo".
+        words = WORD.findall(re.split(r"[|;&\n]", command[m.end():], maxsplit=1)[0])
+        if not words:
+            continue
+        sub = words[0]
+        if sub == "io" and "enumerate" in words[1:3]:
+            continue
+        if sub not in READ_ONLY:
+            return True
+    return False
+
+
+def hook() -> int:
+    call = json.load(sys.stdin)
+    if call.get("tool_name") != "Bash":
+        return 0
+    command = (call.get("tool_input") or {}).get("command", "")
+    if not drives_simulator(command):
+        return 0
+    pid = session_pid()
+    holder = claim(pid, f"session {call.get('session_id', '')[:8]} in {os.path.basename(call.get('cwd', '')) or '?'}", HOOK_WAIT_S, IDLE_S, quiet=True)
+    if holder is None:
+        return 0
+    me = os.path.relpath(__file__)
+    if me.startswith(".."):
+        me = os.path.abspath(__file__)
+    print(
+        f"The simulator is in use by {describe(holder)}. Sessions take turns on it: run "
+        f"`{me} claim` (it waits its turn, up to 15 minutes), then this command again; "
+        f"`{me} release` when you're done with it.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Take turns on the simulator.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("claim")
+    c.add_argument("--wait", type=float, default=WAIT_S)
+    c.add_argument("--label", default="")
+    c.add_argument("--pid", type=int)
+    c.add_argument("--idle", type=int, default=IDLE_S, help="seconds unused before the lease lapses")
+    r = sub.add_parser("release")
+    r.add_argument("--force", action="store_true")
+    r.add_argument("--pid", type=int)
+    sub.add_parser("status")
+    sub.add_parser("hook")
+    a = ap.parse_args()
+
+    if a.cmd == "hook":
+        return hook()
+    if a.cmd == "status":
+        with Lease() as l:
+            print(f"held by {describe(l.held)}" if l.held else "free")
+        return 0
+    pid = a.pid or session_pid()
+    if a.cmd == "claim":
+        holder = claim(pid, a.label, a.wait, a.idle)
+        if holder is None:
+            print(f"claimed (pid {pid})")
+            return 0
+        print(f"still in use by {describe(holder)}", file=sys.stderr)
+        return 1
+    if a.cmd == "release":
+        print("released" if release(pid, a.force) else "not held by you")
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

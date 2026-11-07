@@ -1,0 +1,31 @@
+# The push relay on Fly.io. Once, after `fly auth login`:
+#
+#   fly launch --no-deploy --copy-config --name vibemachine-relay
+#   fly secrets set APNS_KEY_ID=… APNS_TEAM_ID=… APNS_KEY="$(cat AuthKey_….p8)"
+#   fly deploy
+#
+# Then the daemon's default PUSH_RELAY is https://vibemachine-relay.fly.dev (config.ts).
+# Request logging stays off: the relay promises to keep nothing about the pushes it forwards.
+app = "vibemachine-relay"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/health"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

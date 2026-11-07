@@ -1,0 +1,38 @@
+#!/bin/sh
+# The Vibe Machine daemon's command: `vibemachine setup`, `doctor`, `pair`, `sessions`, … (src/cli.ts).
+# `vibemachine daemon` runs the daemon itself (src/main.ts); the LaunchAgent starts it that way, so
+# Node is found afresh at every start instead of pinned in the plist, and a Node upgrade under a
+# version manager doesn't strand it.
+# Works from anywhere, through npm's link or a clone: it finds its own package, runs the JavaScript
+# build when there is one and the TypeScript source otherwise, and says so when Node is too old
+# before anything that would crash on it loads.
+self="$0"
+while [ -L "$self" ]; do
+  target="$(readlink "$self")"
+  case "$target" in /*) self="$target" ;; *) self="$(dirname "$self")/$target" ;; esac
+done
+root="$(cd "$(dirname "$self")/.." && pwd)"
+# The first Node that is new enough, looking where installers put one before the shell's own PATH
+# (a version manager's default is often older than the Node Homebrew installed, and launchd's PATH
+# has no version manager on it at all).
+node=""
+for candidate in /opt/homebrew/bin/node /usr/local/bin/node "$HOME/.volta/bin/node" \
+  "$HOME"/.nvm/versions/node/*/bin/node \
+  "$HOME"/.fnm/node-versions/*/installation/bin/node \
+  "$HOME/Library/Application Support/fnm/node-versions"/*/installation/bin/node \
+  "$(command -v node 2>/dev/null)"; do
+  [ -x "$candidate" ] || continue
+  major="$("$candidate" -p 'process.versions.node.split(".")[0]' 2>/dev/null)"
+  if [ "$major" -ge 24 ] 2>/dev/null; then node="$candidate"; break; fi
+done
+if [ -z "$node" ]; then
+  echo "Vibe Machine needs Node 24 or newer (brew install node, or nodejs.org)$(command -v node >/dev/null 2>&1 && echo "; this is Node $(node -v)")." >&2
+  exit 1
+fi
+entry=cli
+if [ "$1" = "daemon" ]; then entry=main; shift; fi
+if [ -f "$root/dist/$entry.js" ]; then
+  exec "$node" "$root/dist/$entry.js" "$@"
+else
+  exec "$node" --import tsx "$root/src/$entry.ts" "$@"
+fi

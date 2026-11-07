@@ -1,0 +1,61 @@
+{
+  "name": "vibemachine",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Vibe Machine daemon: runs Claude Code sessions on your Mac and streams them to the Vibe Machine iPhone app.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "iphone",
+    "ios",
+    "remote",
+    "daemon",
+    "launchd",
+    "tailscale",
+    "vibe-coding"
+  ],
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "vm": "node --import tsx src/cli.ts",
+    "relay": "node dist/pushrelay.js",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "bin": {
+    "vibemachine": "./bin/vibemachine"
+  },
+  "license": "MIT",
+  "homepage": "https://getvibemachine.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pnlazzaro-png/vibemachine-daemon.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pnlazzaro-png/vibemachine-daemon/issues"
+  },
+  "files": [
+    "dist",
+    "bin/vibemachine",
+    "native",
+    "scripts/sim",
+    ".env.example",
+    "README.md",
+    "LICENSE"
+  ]
+}
