@@ -57,6 +57,7 @@ test("pricing: the hour's cache write, matching the CLI's own figure", () => {
   const cost = costOf("claude-opus-5-5", { input: 26, output: 5626, cacheRead: 516_595, cacheWrite5m: 0, cacheWrite1h: 41_025 });
   assert.ok(cost !== null && Math.abs(cost - 0.544143) < 1e-6, String(cost));
   assert.equal(priceFor("claude-opus-4-5-20251101")?.input, 5);
+  assert.deepEqual(priceFor("claude-fable-5-2"), { input: 8, output: 40, cacheRead: 0.2, cacheWrite5m: 10, cacheWrite1h: 16 });
   assert.equal(priceFor("claude-fable-5-1")?.cacheRead, 0.25);
   assert.equal(priceFor("claude-fable-5")?.cacheRead, 1);
   assert.equal(priceFor("gpt-oss"), null);

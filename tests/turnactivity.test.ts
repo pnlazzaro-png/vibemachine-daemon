@@ -40,6 +40,19 @@ test("tracker: a waiting permission and a failed build take precedence, then cle
   assert.deepEqual([t.state.status, t.state.detail], ["working", ""]);
 });
 
+test("tracker: a waiting permission carries its request id and what it asks, for the Lock Screen's keys", () => {
+  const t = new TurnTracker(1000);
+  t.feed({ type: "control_request", request_id: "r1", request: { subtype: "can_use_tool", tool_name: "Bash", description: "Run the tests", input: { command: "npm test" } } });
+  assert.deepEqual([t.state.requestId, t.state.ask], ["r1", "Bash · Run the tests"]);
+  t.feed({ type: "control_request", request_id: "r2", request: { subtype: "can_use_tool", tool_name: "Edit", input: { file_path: "a.ts" } } });
+  assert.equal(t.state.requestId, "r1");
+  t.feed({ type: "host", subtype: "permission_response", request_id: "r1", behavior: "allow" });
+  assert.deepEqual([t.state.status, t.state.requestId, t.state.ask], ["waiting", "r2", "Edit"]);
+  t.feed({ type: "host", subtype: "permission_response", request_id: "r2", behavior: "deny" });
+  assert.equal(t.state.status, "working");
+  assert.equal("requestId" in t.state, false);
+});
+
 test("tracker: tokens are kept per model call, not summed per partial message, and the result's tally wins", () => {
   const t = new TurnTracker(1000);
   t.feed(start("m1", 1000, 9000));

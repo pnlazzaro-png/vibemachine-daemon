@@ -12,6 +12,7 @@ export interface Price {
 
 /** Longest matching prefix wins, so a dated id (`claude-opus-4-5-20251101`) finds its family. */
 const PRICES: [string, Price][] = [
+  ["claude-fable-5-2", { input: 8, output: 40, cacheRead: 0.2, cacheWrite5m: 10, cacheWrite1h: 16 }],
   ["claude-fable-5-1", { input: 10, output: 50, cacheRead: 0.25, cacheWrite5m: 12.5, cacheWrite1h: 20 }],
   ["claude-mythos-5-1", { input: 10, output: 50, cacheRead: 0.25, cacheWrite5m: 12.5, cacheWrite1h: 20 }],
   ["claude-fable-5", { input: 10, output: 50, cacheRead: 1, cacheWrite5m: 12.5, cacheWrite1h: 20 }],

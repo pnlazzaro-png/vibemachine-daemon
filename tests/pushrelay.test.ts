@@ -66,10 +66,13 @@ test("relaySend: a relay that isn't there is a failed push, not a throw", async 
   assert.match(r.reason ?? "", /^relay/);
 });
 
-test("relay: the caller's address comes from the socket, or the proxy's own header, never X-Forwarded-For", async () => {
+test("relay: the caller's address comes from the socket, or the proxy's own header, never X-Forwarded-For", { skip: !config.apns.keyId && "no APNS_KEY_ID in .env" }, async (t) => {
   const { createRelay } = await import("../src/pushrelay.js");
   const sent: string[] = [];
   const server = createRelay({ perCaller: 2, transport: async (r) => (sent.push(r.token), { status: 200 }) });
+  const trusting = createRelay({ perCaller: 1, clientHeader: "fly-client-ip", transport: async () => ({ status: 200 }) });
+  // Closed whatever happens: a server left listening after a failed assertion keeps the test process alive.
+  t.after(() => { server.close(); trusting.close(); });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as { port: number }).port;
   const body = JSON.stringify({ environment: "development", type: "alert", priority: "10", token: "ab".repeat(32), payload: JSON.stringify({ aps: { alert: "hi" } }) });
@@ -78,13 +81,10 @@ test("relay: the caller's address comes from the socket, or the proxy's own head
   assert.equal(await post({ "x-forwarded-for": "1.1.1.1" }), 200);
   assert.equal(await post({ "x-forwarded-for": "2.2.2.2" }), 200);
   assert.equal(await post({ "x-forwarded-for": "3.3.3.3" }), 429);
-  server.close();
-  const trusting = createRelay({ perCaller: 1, clientHeader: "fly-client-ip", transport: async () => ({ status: 200 }) });
   await new Promise<void>((r) => trusting.listen(0, "127.0.0.1", r));
   const p2 = (trusting.address() as { port: number }).port;
   const post2 = (ip: string) => fetch(`http://127.0.0.1:${p2}/v1/push`, { method: "POST", headers: { "content-type": "application/json", "fly-client-ip": ip }, body }).then((r) => r.status);
   assert.equal(await post2("5.5.5.5"), 200);
   assert.equal(await post2("5.5.5.5"), 429, "the same caller, by the proxy's header");
   assert.equal(await post2("6.6.6.6"), 200, "another caller, by the proxy's header");
-  trusting.close();
 });

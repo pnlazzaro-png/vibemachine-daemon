@@ -214,7 +214,7 @@ async function main(): Promise<void> {
     }
     if (cmd === "preview") {
       await call(key, "POST", `/sessions/${rest[0]}/preview`);
-      console.log("capturing; follow with vm tail");
+      console.log(`capturing; follow with ${cliName} tail`);
       return;
     }
     if (cmd === "stats") {
@@ -256,7 +256,7 @@ async function main(): Promise<void> {
     }
     if (cmd === "export-demo") {
       const [id, dir] = rest;
-      if (!id || !dir) throw new Error("usage: vm export-demo <session-id> <dir>");
+      if (!id || !dir) throw new Error(`usage: ${cliName} export-demo <session-id> <dir>`);
       const full = (await call(key, "GET", "/sessions")) as { sessions: { id: string }[] };
       const match = full.sessions.find((s) => s.id === id || s.id.startsWith(id));
       if (!match) throw new Error(`no session ${id}`);

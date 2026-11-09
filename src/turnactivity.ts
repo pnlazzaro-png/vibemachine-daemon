@@ -35,6 +35,15 @@ export interface TurnActivityState {
   /** The account's five-hour window, 0…1, and when it resets (unix seconds): the session meter. */
   session?: number;
   sessionResetsAt?: number;
+  /** While it waits on the user: the permission request the Lock Screen's Allow and Deny answer, and what it asks. */
+  requestId?: string;
+  ask?: string;
+}
+
+/** What a permission request asks, in a line: the tool and its description, as the push says it. */
+export function askLine(req: Line): string {
+  const line = [req.display_name ?? req.tool_name, req.description].filter((p) => typeof p === "string" && p !== "").join(" · ");
+  return line.length > 80 ? `${line.slice(0, 79)}…` : line;
 }
 
 /** The five-hour window off a rate_limit_event, as the app reads it (StreamReducer's fiveHourUtilization). */
@@ -126,8 +135,8 @@ export class TurnTracker {
   private status: TurnStatus = "working";
   private readonly touched = new Set<StageName>(["prompt"]);
   private readonly failed = new Set<StageName>();
-  /** Permission requests waiting on the user, and the stage each is about. */
-  private readonly waiting = new Map<string, StageName>();
+  /** Permission requests waiting on the user: the stage each is about, and what it asks. */
+  private readonly waiting = new Map<string, { stage: StageName; ask: string }>();
   /** Each model call's usage, by message id: partial messages repeat a message, so it is kept, not summed. */
   private readonly calls = new Map<string, Usage>();
   private currentMessage: string | null = null;
@@ -160,7 +169,7 @@ export class TurnTracker {
         const req = line.request as Line | undefined;
         if (req?.subtype === "can_use_tool" && typeof line.request_id === "string") {
           const stage = stageForTool(String(req.tool_name ?? ""), req.input);
-          this.waiting.set(line.request_id, stage);
+          this.waiting.set(line.request_id, { stage, ask: askLine(req) });
           this.touch(stage);
         }
         break;
@@ -269,16 +278,18 @@ export class TurnTracker {
     const usage = this.final && this.final.input + this.final.output >= sum.input + sum.output ? this.final : sum;
     let stage = this.hot;
     let status = this.status;
+    let asking: { requestId: string; ask: string } | null = null;
     if (!this.finished) {
       // What matters most right now: a failure, then a wait on the user, then what is running.
       const failed = STAGES.find((s) => this.failed.has(s));
-      const waiting = [...this.waiting.values()][0];
+      const waiting = [...this.waiting.entries()][0];
       if (failed) {
         stage = failed;
         status = "failed";
       } else if (waiting) {
-        stage = waiting;
+        stage = waiting[1].stage;
         status = "waiting";
+        asking = { requestId: waiting[0], ask: waiting[1].ask };
       }
     }
     return {
@@ -292,6 +303,7 @@ export class TurnTracker {
       detail: this.detail,
       ...(this.record ? { record: this.record } : {}),
       ...(this.meter ? { session: windowNow(this.meter, this.now()).utilization, ...(this.meter.resetsAt !== undefined ? { sessionResetsAt: this.meter.resetsAt } : {}) } : {}),
+      ...(asking ?? {}),
     };
   }
 }
@@ -346,7 +358,7 @@ export class TurnActivityPacer {
 
   private isImportant(state: TurnActivityState): boolean {
     const l = this.last;
-    return !l || l.stage !== state.stage || l.status !== state.status || l.lit.length !== state.lit.length || l.detail !== state.detail || l.record !== state.record;
+    return !l || l.stage !== state.stage || l.status !== state.status || l.lit.length !== state.lit.length || l.detail !== state.detail || l.record !== state.record || l.requestId !== state.requestId;
   }
 
   private flush(): void {
