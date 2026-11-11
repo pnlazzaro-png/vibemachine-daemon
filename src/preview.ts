@@ -25,7 +25,7 @@ import { finishClip } from "./clips.js";
 import { config } from "./config.js";
 import type { CaptureRow, Store } from "./db.js";
 import type { PipelineLine } from "./pipeline.js";
-import { projectConfig, type PreviewConfig, type Screen } from "./project.js";
+import { forgetDetected, projectConfig, type PreviewConfig, type Screen } from "./project.js";
 import * as sim from "./simulator.js";
 import * as lease from "./simlease.js";
 import * as fold from "./fold.js";
@@ -308,6 +308,8 @@ export interface XcodebuildOutcome {
   title?: string;
   /** The script said it uploaded a build: a ship, as against an archive, a detached launch or a read of the script. */
   shipped?: boolean;
+  /** Stopped on purpose (a newer prompt was queued): not a failure, nothing to tell anyone. */
+  deliberate?: boolean;
   /** The tool put the script in the background: it is still running, and its output lands in this file (if the tool said where). */
   background?: { output: string | null };
 }
@@ -350,7 +352,7 @@ export function releaseOutcome(command: string | undefined, text: string, isErro
     const output = /written to:?\s+(\/\S+?\.output)\b/.exec(text)?.[1] ?? null;
     return { stage: "archive", ok: true, title: testflight ? "uploading to TestFlight" : "archiving for ad hoc", detail: "in the background", background: { output } };
   }
-  if (/Upload stopped/.test(text)) return { stage: "archive", ok: false, title: "upload stopped", detail: "a newer prompt was queued; the next turn ships both" };
+  if (/Upload stopped/.test(text)) return { stage: "archive", ok: false, title: "upload stopped", detail: "a newer prompt was queued; the next turn ships both", deliberate: true };
   // Another session's upload already carried this same app: nothing was sent, and nothing failed.
   const already = text.match(/Already on TestFlight as build (\d+)/);
   if (already) return { stage: "archive", ok: true, title: "already on TestFlight", detail: `build ${already[1]} carries this app; not sent again` };
@@ -539,6 +541,8 @@ export class PreviewWatcher {
         ts: new Date().toISOString(),
       });
     }
+    // A build may have made the app a repo with no .vibemachine.json is found by: look again now.
+    if (outcome && isXcodebuild(command)) forgetDetected(this.cwd);
     // A successful build of the preview's own app counts even when nothing relinked.
     const p = this.preview;
     const force = outcome?.ok === true && outcome.stage === "build" && p !== null && buildsPreviewApp(command, this.cwd, p.app);
@@ -620,7 +624,7 @@ export class PreviewWatcher {
   /** Capture now, whatever happened (vm preview, or the phone): no "before" unless the turn already has one. */
   captureNow(): Promise<void> {
     const p = this.preview;
-    if (!p) throw new Error(`no preview app in ${this.cwd}/.vibemachine.json`);
+    if (!p) throw new Error(`no iPhone app built in ${this.cwd} yet, and no .vibemachine.json naming one`);
     return this.capture(p, this.t, false);
   }
 

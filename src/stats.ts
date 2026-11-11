@@ -500,10 +500,11 @@ function turnIndex(promptTimes: string[], ts: string): number {
 }
 
 /**
- * The arcade's high-score table for the span: the dearest turn, the dearest and longest sessions,
- * the busiest day, the streak, the best combo, the fastest ship, the cheapest turn that still
- * shipped a commit, the commit spree, the longest think, the tool frenzy, the marathon turn, the most
- * interrupted session, the latest night and the earliest morning.
+ * The arcade's high-score table for the span: the most expensive turn and session, the longest turn
+ * and session, the busiest day, the streak, the best combo, the fastest ship, the cheapest turn that
+ * still shipped a commit, the commit spree, the longest think, the tool frenzy, the most interrupted
+ * session, the latest night and the earliest morning. (Until 2026-11-10 the first two were "dearest"
+ * and the longest turn was "marathon turn", far down the table; the phone carries old marks over.)
  */
 function scores(store: Store, q: StatsQuery, since: string, until: string, series: Bucket[]): Score[] {
   const db = store.db;
@@ -556,15 +557,15 @@ function scores(store: Store, q: StatsQuery, since: string, until: string, serie
   const sessionOf = (turnKey: string) => turnKey.slice(0, turnKey.lastIndexOf(":"));
   let bestTurn: { key: string; cost: number; cwd: string; ts: string } | null = null;
   let deepest: { key: string; thinking: number; cwd: string; ts: string } | null = null;
-  // The marathon: the turn that worked longest, from its prompt to its last call, idle stretches capped.
-  let marathon: { key: string; ms: number; cwd: string; ts: string } | null = null;
+  // The longest turn: the one that worked longest, from its prompt to its last call, idle stretches capped.
+  let longestTurn: { key: string; ms: number; cwd: string; ts: string } | null = null;
   for (const [key, t] of turnCost) {
     if (!bestTurn || t.cost > bestTurn.cost) bestTurn = { key, ...t };
     if (t.thinking > 0 && (!deepest || t.thinking > deepest.thinking)) deepest = { key, ...t };
-    if (!marathon || t.active > marathon.ms) marathon = { key, ms: t.active, cwd: t.cwd, ts: t.ts };
+    if (!longestTurn || t.active > longestTurn.ms) longestTurn = { key, ms: t.active, cwd: t.cwd, ts: t.ts };
   }
   if (bestTurn) {
-    out.push({ label: "dearest turn", value: money(bestTurn.cost), detail: story(bestTurn.cwd, sessionOf(bestTurn.key), bestTurn.ts), kind: "cost", project: projectName(bestTurn.cwd), n: bestTurn.cost, better: "high" });
+    out.push({ label: "most expensive turn", value: money(bestTurn.cost), detail: story(bestTurn.cwd, sessionOf(bestTurn.key), bestTurn.ts), kind: "cost", project: projectName(bestTurn.cwd), n: bestTurn.cost, better: "high" });
   }
   let bestSession: { id: string; cost: number; cwd: string; first: string } | null = null;
   let longest: { id: string; ms: number; cwd: string; first: string } | null = null;
@@ -572,7 +573,8 @@ function scores(store: Store, q: StatsQuery, since: string, until: string, serie
     if (!bestSession || s.cost > bestSession.cost) bestSession = { id, cost: s.cost, cwd: s.cwd, first: s.first };
     if (!longest || s.active > longest.ms) longest = { id, ms: s.active, cwd: s.cwd, first: s.first };
   }
-  if (bestSession) out.push({ label: "dearest session", value: money(bestSession.cost), detail: story(bestSession.cwd, bestSession.id, bestSession.first), kind: "cost", project: projectName(bestSession.cwd), n: bestSession.cost, better: "high" });
+  if (bestSession) out.push({ label: "most expensive session", value: money(bestSession.cost), detail: story(bestSession.cwd, bestSession.id, bestSession.first), kind: "cost", project: projectName(bestSession.cwd), n: bestSession.cost, better: "high" });
+  if (longestTurn && longestTurn.ms >= 60_000) out.push({ label: "longest turn", value: clock(longestTurn.ms), detail: story(longestTurn.cwd, sessionOf(longestTurn.key), longestTurn.ts), kind: "time", project: projectName(longestTurn.cwd), n: longestTurn.ms, better: "high" });
   if (longest && longest.ms > 0) out.push({ label: "longest session", value: duration(longest.ms), detail: story(longest.cwd, longest.id, longest.first), kind: "time", project: projectName(longest.cwd), n: longest.ms, better: "high" });
 
   const busiest = series.reduce<Bucket | null>((best, b) => (b.prompts > (best?.prompts ?? 0) ? b : best), null);
@@ -653,8 +655,6 @@ function scores(store: Store, q: StatsQuery, since: string, until: string, serie
     const [key, t] = frenzy;
     out.push({ label: "tool frenzy", value: `${t.n} tools`, detail: `in one turn · ${story(t.cwd, sessionOf(key), turnCost.get(key)?.ts ?? toolCalls[0]!.ts)}`, kind: "count", project: projectName(t.cwd), n: t.n, better: "high" });
   }
-
-  if (marathon && marathon.ms >= 60_000) out.push({ label: "marathon turn", value: clock(marathon.ms), detail: story(marathon.cwd, sessionOf(marathon.key), marathon.ts), kind: "time", project: projectName(marathon.cwd), n: marathon.ms, better: "high" });
 
   const interrupted = db
     .prepare(`SELECT session_id, cwd, count(*) AS n, min(ts) AS first FROM activity a WHERE kind = 'interrupt' AND ${where("a")} GROUP BY session_id ORDER BY n DESC, first LIMIT 1`)

@@ -44,3 +44,12 @@ test("project: a screen's view, and the display it implies", () => {
   assert.deepEqual(preview!.screens.map((s) => [s.name, s.view, s.display]), [["Open", "unfolded", "inner"], ["Shut", "folded landscape", "cover"], ["Plain", undefined, undefined]]);
   assert.throws(() => parseProjectConfig({ preview: { bundle_id: "a.b", app: "x.app", screens: [{ name: "Bad", view: "sideways" }] } }, "/tmp"), /view must be one of/);
 });
+
+test("stopping an upload when a prompt is queued is the project's choice, off unless asked for", () => {
+  assert.equal(parseProjectConfig({}, "/tmp").stopUploadsOnPrompt, false);
+  assert.equal(parseProjectConfig({ preview: { web: "http://localhost:5173" } }, "/tmp").stopUploadsOnPrompt, false);
+  assert.equal(parseProjectConfig({ release: { stop_on_prompt: true } }, "/tmp").stopUploadsOnPrompt, true);
+  assert.equal(parseProjectConfig({ release: { stop_on_prompt: true }, preview: { bundle_id: "a.b", app: "x.app" } }, "/tmp").stopUploadsOnPrompt, true);
+  // Only the word itself turns it on.
+  assert.equal(parseProjectConfig({ release: { stop_on_prompt: "yes" } }, "/tmp").stopUploadsOnPrompt, false);
+});

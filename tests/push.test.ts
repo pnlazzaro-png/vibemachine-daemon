@@ -9,7 +9,9 @@ import { test } from "node:test";
 import { config } from "../src/config.js";
 import { Store } from "../src/db.js";
 import { Notifier } from "../src/notifier.js";
-import { activityStartPayload, activityUpdatePayload, alertPayload, providerToken, validToken, type Transport } from "../src/push.js";
+import http2 from "node:http2";
+import type { AddressInfo } from "node:net";
+import { activityStartPayload, activityUpdatePayload, alertPayload, apnsTransport, providerToken, validToken, type Transport } from "../src/push.js";
 
 test("alert payload: a permission prompt is time-sensitive with buttons; a turn end is not", () => {
   const permission = JSON.parse(alertPayload({ title: "vibemachine needs your OK", body: "Bash · build it", sessionId: "s1", requestId: "r1" })) as Record<string, any>;
@@ -74,10 +76,10 @@ test("notifier: skips a phone watching the session, drops a token Apple says is 
   let watching = true;
   const notifier = new Notifier(store, () => watching, transport);
 
-  await notifier.notify({ sessionId: session, title: "t", body: "b" });
+  await notifier.notify({ sessionId: session, kind: "turn_done", title: "t", body: "b" });
   assert.equal(sent.length, 0, "watching the session: no push");
   watching = false;
-  await notifier.notify({ sessionId: session, title: "t", body: "b", requestId: "r" });
+  await notifier.notify({ sessionId: session, kind: "permission", title: "t", body: "b", requestId: "r" });
   assert.equal(sent.length, 1);
   assert.equal(sent[0]!.type, "alert");
   assert.equal(sent[0]!.payload.aps.category, "vm.permission");
@@ -97,8 +99,59 @@ test("notifier: skips a phone watching the session, drops a token Apple says is 
   assert.equal(store.activityTokens(session).length, 0, "ended: token forgotten");
 
   answer = { status: 410, reason: "Unregistered" };
-  await notifier.notify({ sessionId: session, title: "t", body: "b" });
+  await notifier.notify({ sessionId: session, kind: "turn_done", title: "t", body: "b" });
   assert.equal(store.pushDevices().length, 0, "a gone token is dropped");
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("apns transport: pushes share one connection, and one Apple has closed is replaced", async () => {
+  // A stand-in for Apple: counts connections, answers 200, and can hang up on everyone.
+  const sessions = new Set<http2.ServerHttp2Session>();
+  let opened = 0;
+  const seen: string[] = [];
+  const apple = http2.createServer((req, res) => {
+    seen.push(req.url);
+    res.writeHead(200);
+    res.end();
+  });
+  apple.on("session", (s) => {
+    opened += 1;
+    sessions.add(s);
+    s.on("close", () => sessions.delete(s));
+  });
+  await new Promise<void>((resolve) => apple.listen(0, "127.0.0.1", resolve));
+  const host = `http://127.0.0.1:${(apple.address() as AddressInfo).port}`;
+  const transport = apnsTransport({ idleMs: 150, timeoutMs: 2000 });
+  const push = (token: string) => transport({ host, token, headers: {}, payload: "{}" });
+  try {
+    assert.deepEqual(await Promise.all([push("a1"), push("a2"), push("a3")]), [{ status: 200, reason: undefined }, { status: 200, reason: undefined }, { status: 200, reason: undefined }]);
+    assert.equal((await push("a4")).status, 200);
+    assert.equal(opened, 1, "four pushes, one connection");
+    assert.deepEqual(seen.sort(), ["/3/device/a1", "/3/device/a2", "/3/device/a3", "/3/device/a4"]);
+
+    // Apple hangs up (it does after an hour, or on a bad provider token): the next push still lands.
+    for (const s of sessions) s.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal((await push("b1")).status, 200);
+    assert.equal(opened, 2);
+
+    // Left quiet, the connection is closed; the push after that opens another.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(sessions.size, 0, "closed after the idle spell");
+    assert.equal((await push("c1")).status, 200);
+    assert.equal(opened, 3);
+  } finally {
+    transport.close();
+    for (const s of sessions) s.destroy();
+    await new Promise<void>((resolve) => apple.close(() => resolve()));
+  }
+});
+
+test("apns transport: nobody there is a failed push with a reason, not a throw", async () => {
+  const transport = apnsTransport({ timeoutMs: 1000 });
+  const sent = await transport({ host: "http://127.0.0.1:9", token: "a1", headers: {}, payload: "{}" });
+  assert.equal(sent.status, 0);
+  assert.ok(sent.reason);
+  transport.close();
 });

@@ -47,5 +47,10 @@ function shutdown(signal: string): void {
     process.exit(0);
   }, 500).unref();
 }
+// Every session on the phone is a child of this process, so dying takes every running turn with
+// it. An error nobody caught (a full disk under a write, a handler's bug) is said in the log and
+// the daemon carries on: the turn it came from may be the worse for it, the others are not.
+process.on("unhandledRejection", (reason) => console.error("unhandled rejection (carrying on):", reason));
+process.on("uncaughtException", (err) => console.error("uncaught exception (carrying on):", err));
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));

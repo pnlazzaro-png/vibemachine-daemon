@@ -1,6 +1,6 @@
 {
   "name": "vibemachine-daemon",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Vibe Machine daemon: runs Claude Code sessions on your Mac and streams them to the Vibe Machine iPhone app.",
   "keywords": [

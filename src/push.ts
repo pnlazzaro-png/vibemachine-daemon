@@ -180,39 +180,120 @@ export function activityUpdatePayload(update: LiveActivityUpdate, now = Date.now
 
 // Transport
 
-export const http2Transport: Transport = ({ host, token, headers, payload }) =>
-  new Promise((resolve) => {
-    let settled = false;
-    const done = (r: { status: number; reason?: string | undefined }) => {
-      if (settled) return;
-      settled = true;
-      session.close();
-      resolve(r);
-    };
+export interface ApnsTransportOptions {
+  /** A connection with nothing in flight for this long is closed; the next push opens another. */
+  idleMs?: number;
+  /** How long one push may take before it counts as lost. */
+  timeoutMs?: number;
+}
+
+/**
+ * Pushes to Apple over one HTTP/2 connection per host, kept open between pushes as Apple asks
+ * (it reads a connection per push as an attack) and closed after a quiet spell. A connection that
+ * Apple has closed, or that died while it sat, is dropped and the push tried once more on a new one.
+ * An open connection holds the process up only while a push is in flight.
+ */
+export function apnsTransport(opts: ApnsTransportOptions = {}): Transport & { close(): void } {
+  const idleMs = opts.idleMs ?? 60_000;
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  interface Conn {
+    session: http2.ClientHttp2Session;
+    inFlight: number;
+    idle: NodeJS.Timeout | null;
+  }
+  const conns = new Map<string, Conn>();
+  const usable = (c: Conn | undefined): c is Conn => !!c && !c.session.closed && !c.session.destroyed;
+  const drop = (host: string, conn: Conn) => {
+    if (conns.get(host) === conn) conns.delete(host);
+    if (conn.idle) clearTimeout(conn.idle);
+    conn.idle = null;
+  };
+  const connect = (host: string): Conn => {
     const session = http2.connect(host);
-    session.setTimeout(15_000, () => {
-      session.destroy();
-      done({ status: 0, reason: "timeout" });
-    });
-    session.on("error", (err) => done({ status: 0, reason: err.message }));
-    const req = session.request({ ":method": "POST", ":path": `/3/device/${token}`, "content-type": "application/json", ...headers });
-    let status = 0;
-    let data = "";
-    req.setEncoding("utf8");
-    req.on("response", (h) => (status = Number(h[":status"] ?? 0)));
-    req.on("data", (chunk: string) => (data += chunk));
-    req.on("end", () => {
-      let reason: string | undefined;
+    const conn: Conn = { session, inFlight: 0, idle: null };
+    // Each of these means no new push should go on it; pushes in flight settle through their own streams.
+    session.on("error", () => drop(host, conn));
+    session.on("goaway", () => drop(host, conn));
+    session.on("close", () => drop(host, conn));
+    conns.set(host, conn);
+    return conn;
+  };
+  const rest = (host: string, conn: Conn) => {
+    conn.inFlight -= 1;
+    if (conn.inFlight > 0 || conn.session.destroyed) return;
+    conn.session.unref();
+    if (conns.get(host) !== conn) return void conn.session.close();
+    conn.idle = setTimeout(() => {
+      drop(host, conn);
+      conn.session.close();
+    }, idleMs);
+    conn.idle.unref();
+  };
+  const attempt = (conn: Conn, { host, token, headers, payload }: Parameters<Transport>[0]): Promise<{ status: number; reason?: string | undefined }> =>
+    new Promise((resolve) => {
+      if (conn.idle) clearTimeout(conn.idle);
+      conn.idle = null;
+      conn.inFlight += 1;
+      conn.session.ref();
+      let settled = false;
+      const done = (r: { status: number; reason?: string | undefined }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        rest(host, conn);
+        resolve(r);
+      };
+      // No answer in time: the connection is probably dead, so nothing else should wait on it.
+      const timer = setTimeout(() => {
+        drop(host, conn);
+        conn.session.destroy();
+        done({ status: 0, reason: "timeout" });
+      }, timeoutMs);
+      let req: http2.ClientHttp2Stream;
       try {
-        reason = data ? (JSON.parse(data) as { reason?: string }).reason : undefined;
-      } catch {
-        reason = data.slice(0, 120) || undefined;
+        req = conn.session.request({ ":method": "POST", ":path": `/3/device/${token}`, "content-type": "application/json", ...headers });
+      } catch (err) {
+        drop(host, conn);
+        return done({ status: 0, reason: err instanceof Error ? err.message : String(err) });
       }
-      done({ status, reason });
+      let status = 0;
+      let data = "";
+      req.setEncoding("utf8");
+      req.on("response", (h) => (status = Number(h[":status"] ?? 0)));
+      req.on("data", (chunk: string) => (data += chunk));
+      req.on("end", () => {
+        let reason: string | undefined;
+        try {
+          reason = data ? (JSON.parse(data) as { reason?: string }).reason : undefined;
+        } catch {
+          reason = data.slice(0, 120) || undefined;
+        }
+        done({ status, reason });
+      });
+      req.on("error", (err) => done({ status: 0, reason: err.message }));
+      req.on("close", () => done({ status: 0, reason: "connection closed" }));
+      req.end(payload);
     });
-    req.on("error", (err) => done({ status: 0, reason: err.message }));
-    req.end(payload);
+  const transport = async (req: Parameters<Transport>[0]) => {
+    const kept = conns.get(req.host);
+    const reused = usable(kept);
+    const first = await attempt(reused ? kept : connect(req.host), req);
+    // Apple never answered on a connection that had been sitting: once more, on a fresh one.
+    if (first.status !== 0 || !reused) return first;
+    const now = conns.get(req.host);
+    return attempt(usable(now) && now !== kept ? now : connect(req.host), req);
+  };
+  return Object.assign(transport, {
+    close() {
+      for (const [host, conn] of [...conns]) {
+        drop(host, conn);
+        conn.session.close();
+      }
+    },
   });
+}
+
+export const http2Transport = apnsTransport();
 
 const GONE = new Set(["BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic", "ExpiredToken"]);
 

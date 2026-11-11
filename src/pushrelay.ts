@@ -9,9 +9,11 @@
 //
 // What it guards: the topic is always this app's (a caller can't push for
 // another bundle), payloads must be APNs JSON with an `aps` object and fit
-// Apple's 4 KB, tokens must be hex, and each caller and each token has a
-// rate limit. A token is the only key to a phone, and only the phone and
-// the daemon it paired with know it, which is what lets the relay be open.
+// Apple's 4 KB, tokens must be hex, and each caller, each token and the
+// relay as a whole has a rate limit (a caller on IPv6 is its /64: one
+// customer holds a whole one). A token is the only key to a phone, and only
+// the phone and the daemon it paired with know it, which is what lets the
+// relay be open. Pushes share one connection to Apple (push.ts).
 //
 // Run with `npm run relay` (RELAY_PORT, default 3009; RELAY_HOST, default
 // 127.0.0.1, 0.0.0.0 in a container); it reads the same APNS_* settings as
@@ -53,37 +55,71 @@ export function parseRelayRequest(body: unknown): RelayRequest | { error: string
   return { environment: environmentFrom(b.environment), type: b.type, priority, token: b.token.toLowerCase(), payload };
 }
 
-/** A sliding count per key: at most `limit` in any `windowMs`. */
+/**
+ * A sliding count per key: at most `limit` in any `windowMs`. Keys gone quiet are dropped once a
+ * window, and the map never holds more than `maxKeys`: past that a key not seen before is refused
+ * (a flood of new addresses can't grow it, and the callers already known carry on).
+ */
 export class RateLimit {
   private hits = new Map<string, number[]>();
-  constructor(private readonly limit: number, private readonly windowMs: number) {}
+  private swept = 0;
+  constructor(private readonly limit: number, private readonly windowMs: number, private readonly maxKeys = 50_000) {}
+
+  get size(): number {
+    return this.hits.size;
+  }
 
   allow(key: string, now = Date.now()): boolean {
-    const recent = (this.hits.get(key) ?? []).filter((t) => now - t < this.windowMs);
+    if (now - this.swept >= this.windowMs) {
+      this.swept = now;
+      for (const [k, v] of this.hits) if (v.every((t) => now - t >= this.windowMs)) this.hits.delete(k);
+    }
+    const known = this.hits.get(key);
+    if (!known && this.hits.size >= this.maxKeys) return false;
+    const recent = (known ?? []).filter((t) => now - t < this.windowMs);
     if (recent.length >= this.limit) {
       this.hits.set(key, recent);
       return false;
     }
     recent.push(now);
     this.hits.set(key, recent);
-    if (this.hits.size > 10_000) for (const [k, v] of this.hits) if (v.every((t) => now - t >= this.windowMs)) this.hits.delete(k);
     return true;
   }
+}
+
+/**
+ * What a caller's address counts as for the rate limit: an IPv4 address itself (also when it
+ * arrives mapped into IPv6), an IPv6 address's /64, since one customer is handed the whole of one
+ * and could otherwise be 2^64 callers.
+ */
+export function callerKey(address: string): string {
+  const a = address.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/%.*$/, "");
+  const mapped = /^(?:::ffff:|0:0:0:0:0:ffff:)(\d+\.\d+\.\d+\.\d+)$/.exec(a);
+  if (mapped) return mapped[1]!;
+  if (!a.includes(":")) return a || "?";
+  const [head = "", tail] = a.split("::");
+  const front = head ? head.split(":") : [];
+  const back = tail ? tail.split(":") : [];
+  const groups = tail === undefined ? front : [...front, ...Array<string>(Math.max(8 - front.length - back.length, 0)).fill("0"), ...back];
+  return groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, "")).join(":") + "::/64";
 }
 
 export interface RelayOptions {
   /** The header a trusted proxy sets with the caller's address (lower-case), e.g. `fly-client-ip`; none: the socket's address. */
   clientHeader?: string;
   transport?: Transport;
-  /** Per caller (address) and per device token, each a minute's worth. */
+  /** Per caller (address, or its /64) and per device token, each a minute's worth. */
   perCaller?: number;
   perToken?: number;
+  /** Every caller together, a minute's worth: what the relay will ever ask of Apple. */
+  overall?: number;
 }
 
 export function createRelay(opts: RelayOptions = {}): http.Server {
   const transport = opts.transport ?? http2Transport;
   const callers = new RateLimit(opts.perCaller ?? 120, 60_000);
   const tokens = new RateLimit(opts.perToken ?? 30, 60_000);
+  const overall = new RateLimit(opts.overall ?? 3000, 60_000);
   const clientHeader = (opts.clientHeader ?? process.env.RELAY_CLIENT_HEADER ?? "").trim().toLowerCase() || null;
   const reply = (res: http.ServerResponse, status: number, body: unknown) => {
     res.writeHead(status, { "content-type": "application/json" });
@@ -95,7 +131,7 @@ export function createRelay(opts: RelayOptions = {}): http.Server {
     if (req.method !== "POST" || !url.pathname.endsWith("/v1/push")) return reply(res, 404, { error: "not found" });
     // Behind a proxy the socket is the proxy's; only a header the proxy itself sets names the caller.
     const forwarded = clientHeader ? String(req.headers[clientHeader] ?? "").split(",")[0]!.trim() : "";
-    const caller = forwarded || req.socket.remoteAddress || "?";
+    const caller = callerKey(forwarded || req.socket.remoteAddress || "?");
     if (!callers.allow(caller)) return reply(res, 429, { error: "slow down" });
     let size = 0;
     const chunks: Buffer[] = [];
@@ -114,6 +150,7 @@ export function createRelay(opts: RelayOptions = {}): http.Server {
       const r = parseRelayRequest(body);
       if ("error" in r) return reply(res, 400, r);
       if (!tokens.allow(r.token)) return reply(res, 429, { error: "slow down" });
+      if (!overall.allow("all")) return reply(res, 429, { error: "the relay is busy; try again in a minute" });
       if (!apnsConfigured()) return reply(res, 503, { error: "the relay has no APNs key" });
       let headers: Record<string, string>;
       try {

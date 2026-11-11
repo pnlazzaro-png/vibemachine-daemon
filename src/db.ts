@@ -72,6 +72,8 @@ export interface DeviceRow {
   push_error: string | null;
   /** ActivityKit push-to-start token, so the daemon can start a Live Activity from the Mac. */
   activity_start_token: string | null;
+  /** Which pushes this phone wants, as JSON (notifier.ts `pushKinds`); null for the defaults. */
+  push_kinds: string | null;
 }
 
 export interface ActivityTokenRow {
@@ -96,6 +98,9 @@ export class Store {
 
   constructor(path = dbPath, schemaVersion = SCHEMA_VERSION) {
     this.db = new DatabaseSync(path);
+    // The CLI is a second connection (`vibemachine pair`, `forget`): a write of its that overlaps one
+    // of the daemon's would otherwise fail at once with "database is locked", in the middle of a turn.
+    this.db.exec("PRAGMA busy_timeout = 5000");
     const found = (this.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
     const existing = (this.db.prepare(`SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'sessions'`).get() as { n: number }).n > 0;
     if (path !== ":memory:" && existing && found > 0 && found < schemaVersion) this.backup(path, schemaVersion);
@@ -233,7 +238,7 @@ export class Store {
       );
     `);
     // Columns added after the first release.
-    this.addColumns("devices", ["push_token", "push_environment", "push_error", "activity_start_token"]);
+    this.addColumns("devices", ["push_token", "push_environment", "push_error", "activity_start_token", "push_kinds"]);
     this.addColumns("sessions", ["effort", "archived_at"]);
     // When a tool finished (the ship times need it): the ledger reads every transcript again to
     // fill it in for the rows it already has (inserts are ignored, the updates land).
@@ -278,6 +283,11 @@ export class Store {
 
   getSession(id: string): SessionRow | undefined {
     return this.db.prepare(`SELECT * FROM sessions WHERE id = ?`).get(id) as SessionRow | undefined;
+  }
+
+  /** Sessions mid-turn: starting, running, or waiting on a permission. */
+  liveSessions(): number {
+    return (this.db.prepare(`SELECT count(*) AS n FROM sessions WHERE status IN ('starting', 'running', 'waiting')`).get() as { n: number }).n;
   }
 
   listSessions(limit = 100): SessionRow[] {
@@ -377,6 +387,25 @@ export class Store {
          WHERE s.cwd = ? AND c.screen = ? AND c.kind != 'look' AND c.id != ? ORDER BY c.created_at DESC LIMIT 1`,
       )
       .get(cwd, screen, except) as CaptureRow | undefined;
+  }
+
+  /** The newest picture a session has (an after shot or a look, never a before): its face in the phone's session list. */
+  sessionThumb(sessionId: string): { id: string; width: number; height: number } | null {
+    const row = this.db
+      .prepare(`SELECT id, width, height FROM captures WHERE session_id = ? AND kind != 'before' ORDER BY created_at DESC, rowid DESC LIMIT 1`)
+      .get(sessionId) as { id: string; width: number; height: number } | undefined;
+    return row ? { id: row.id, width: row.width, height: row.height } : null;
+  }
+
+  /** How a session's last turns went, oldest first: how long each took and whether it ended well. */
+  turnTrail(sessionId: string, limit = 12): { ms: number; ok: boolean }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT json_extract(json, '$.duration_ms') AS ms, subtype FROM events
+         WHERE session_id = ? AND type = 'result' ORDER BY seq DESC LIMIT ?`,
+      )
+      .all(sessionId, limit) as { ms: number | null; subtype: string | null }[];
+    return rows.reverse().map((r) => ({ ms: Math.max(0, Math.round(r.ms ?? 0)), ok: r.subtype === "success" }));
   }
 
   deleteCapture(id: string): void {
@@ -498,6 +527,10 @@ export class Store {
 
   setPushError(id: string, error: string | null): void {
     this.db.prepare(`UPDATE devices SET push_error = ? WHERE id = ?`).run(error, id);
+  }
+
+  setPushKinds(id: string, kinds: string | null): void {
+    this.db.prepare(`UPDATE devices SET push_kinds = ? WHERE id = ?`).run(kinds, id);
   }
 
   setActivityStartToken(id: string, token: string | null): void {

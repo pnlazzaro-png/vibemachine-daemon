@@ -101,12 +101,26 @@ export function captureRefs(event: unknown, out: Map<string, CaptureRef> = new M
   return out;
 }
 
+/** What the phone reads off a session's `init` line; the rest is the recording Mac's own setup. */
+const INIT_KEPT = ["type", "subtype", "session_id", "uuid", "model", "claude_code_version", "permissionMode", "cwd"];
+
+/**
+ * The `init` line as the demo needs it. The CLI's own lists every tool, MCP server, plugin, skill
+ * and memory path on the Mac that recorded it: whose connectors those are is nobody's business, and
+ * the phone draws none of it.
+ */
+export function slimInit(event: unknown): unknown {
+  const e = event as Record<string, unknown> | null;
+  if (!e || e.type !== "system" || e.subtype !== "init") return event;
+  return Object.fromEntries(INIT_KEPT.filter((k) => k in e).map((k) => [k, e[k]]));
+}
+
 /** The lines worth replaying, in the phone's envelope shape, the newest rate-limit line kept for the gauge. */
 export function demoEvents(rows: { session_id: string; seq: number; ts: string; type: string; subtype: string | null; json: string }[]): { session_id: string; seq: number; ts: string; event: unknown }[] {
   const lastRateLimit = rows.filter((r) => r.type === "rate_limit_event").at(-1)?.seq;
   return rows
     .filter((r) => !DROPPED_TYPES.has(r.type) && !(r.type === "system" && DROPPED_SYSTEM.has(r.subtype ?? "")) && (r.type !== "rate_limit_event" || r.seq === lastRateLimit))
-    .map((r) => ({ session_id: r.session_id, seq: r.seq, ts: r.ts, event: cut(trimForRelay(JSON.parse(r.json))) }));
+    .map((r) => ({ session_id: r.session_id, seq: r.seq, ts: r.ts, event: cut(slimInit(trimForRelay(JSON.parse(r.json)))) }));
 }
 
 export async function exportDemo(store: Store, sessionId: string, outDir: string, fetchJson: (path: string) => Promise<unknown>, rules: ScrubRule[] = scrubRules()): Promise<{ events: number; captures: number; bytes: number }> {

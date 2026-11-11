@@ -4,16 +4,20 @@
 // there, and prints a pairing code with the address to type on the phone.
 // Doctor checks each thing the phone needs and says what to do about the
 // ones that are missing. Both are run by hand; nothing here is automatic.
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import https from "node:https";
 import { newPairingCode } from "./auth.js";
-import { ensureTls, lanAddress, pairingLink, printQr } from "./lan.js";
+import { ensureTls, lanAddress, localHostName, pairingLink, printQr } from "./lan.js";
 import { ffmpegAvailable } from "./video.js";
-import { cliName, config, daemonRoot, defaultDataDir, envFile as configEnvFile, packageVersion, toolPath } from "./config.js";
+import { createInterface } from "node:readline/promises";
+import { cliName, config, daemonRoot, defaultDataDir, envFile as configEnvFile, expandHome, packageVersion, toolPath } from "./config.js";
 import type { Store } from "./db.js";
+
+/** The name on npm. The command it installs is `vibemachine`. */
+export const PACKAGE = "vibemachine-daemon";
 
 export interface Check {
   ok: boolean;
@@ -118,6 +122,8 @@ export interface TailscaleInfo {
   dnsName: string | null;
   /** Serve already fronts the daemon's port with HTTPS. */
   serving: boolean;
+  /** iPhones (and iPads) on the tailnet; absent when Tailscale didn't say. */
+  iosPeers?: number;
 }
 
 export function tailscale(): TailscaleInfo {
@@ -126,34 +132,56 @@ export function tailscale(): TailscaleInfo {
   const status = run(bin, ["status", "--json"]);
   let dnsName: string | null = null;
   let running = false;
+  let iosPeers: number | undefined;
   try {
-    const j = JSON.parse(status.out) as { BackendState?: string; Self?: { DNSName?: string } };
+    const j = JSON.parse(status.out) as { BackendState?: string; Self?: { DNSName?: string }; Peer?: Record<string, { OS?: string }> | null };
     running = j.BackendState === "Running";
     dnsName = j.Self?.DNSName?.replace(/\.$/, "") ?? null;
+    if (running) iosPeers = Object.values(j.Peer ?? {}).filter((peer) => peer.OS === "iOS").length;
   } catch {
     /* not running, or an old client */
   }
   const serve = run(bin, ["serve", "status"]);
   const serving = serve.ok && new RegExp(`:${config.port}\\b[\\s\\S]*?proxy http://${config.host}:${config.port}`).test(serve.out);
-  return { installed: true, running, dnsName, serving };
+  return { installed: true, running, dnsName, serving, ...(iosPeers === undefined ? {} : { iosPeers }) };
+}
+
+/**
+ * Whether the pairing code should carry the Wi-Fi address although Tailscale serves the daemon:
+ * asked for (`--wifi`), or no iPhone is on the tailnet, so a tailnet address would be a code the
+ * phone can't reach while every check here is green. Only when the Wi-Fi listener is on.
+ */
+export function prefersWifi(ts: TailscaleInfo, lan = config.lan, asked?: boolean): boolean {
+  if (!lan) return false;
+  return asked ?? (ts.running && ts.serving && ts.iosPeers === 0);
 }
 
 /** The address the phone uses: the tailnet HTTPS name when Serve fronts the port (it works at home
  *  and away), else the Wi-Fi listener when it's on, else loopback (this Mac only: the simulator). */
-export function serverAddress(ts: TailscaleInfo, lan = config.lan): string {
+export function serverAddress(ts: TailscaleInfo, lan = config.lan, wifi = false): string {
+  if (wifi && lan) return lanAddress();
   if (ts.running && ts.dnsName && ts.serving) return `https://${ts.dnsName}:${config.port}`;
   if (lan) return lanAddress();
   return `http://${config.host}:${config.port}`;
 }
 
 /** Where the phone should pair, and the certificate to pin when that's the Wi-Fi listener. */
-export function pairingTarget(lan = config.lan, ts: TailscaleInfo = tailscale()): { address: string; fingerprint?: string } {
-  const address = serverAddress(ts, lan);
-  return address.startsWith("https://") && address === lanAddress() ? { address, fingerprint: ensureTls().fingerprint } : { address };
+export function pairingTarget(lan = config.lan, ts: TailscaleInfo = tailscale(), wifi?: boolean): { address: string; fingerprint?: string; note?: string } {
+  const overWifi = prefersWifi(ts, lan, wifi);
+  const address = serverAddress(ts, lan, overWifi);
+  const tailnet = ts.running && ts.serving && !overWifi;
+  const note = wifi && !lan
+    ? `The Wi-Fi side is off: run \`${cliName} setup --wifi\` first. This code is for your tailnet.`
+    : overWifi && ts.serving
+      ? `This code works on your Wi-Fi${wifi ? "" : " (no iPhone is on your tailnet)"}. For one that also works away from home, put Tailscale on the iPhone and run \`${cliName} pair\`.`
+      : tailnet
+        ? `This code is for your tailnet: the iPhone needs Tailscale too. No Tailscale on the phone? Run \`${cliName} setup --wifi\`.`
+        : undefined;
+  return { address, ...(address.startsWith("https://") && address === lanAddress() ? { fingerprint: ensureTls().fingerprint } : {}), ...(note ? { note } : {}) };
 }
 
 /** A fresh pairing code, printed with the address and as a QR code the phone's Camera opens in the app. */
-export async function printPairing(store: Store, target: { address: string; fingerprint?: string }): Promise<void> {
+export async function printPairing(store: Store, target: { address: string; fingerprint?: string; note?: string }): Promise<void> {
   const code = newPairingCode();
   store.createPairingCode(code, new Date(Date.now() + config.pairingMinutes * 60_000));
   const link = pairingLink(target.address, code, target.fingerprint);
@@ -163,6 +191,7 @@ export async function printPairing(store: Store, target: { address: string; fing
   console.log(`  Server:        ${target.address}`);
   console.log(`  Pairing code:  ${code}  (valid ${config.pairingMinutes} minutes; \`vibemachine pair\` prints another)`);
   if (target.fingerprint) console.log(`  Certificate:   ${target.fingerprint.slice(0, 16)}… (the phone pins it from the QR code)`);
+  if (target.note) console.log(`  ${target.note}`);
   if (target.address.startsWith("http://127.")) console.log("  The phone can't reach 127.0.0.1: run `vibemachine setup --lan`, or install Tailscale on both and run `vibemachine setup` again.");
 }
 
@@ -173,19 +202,98 @@ export function setEnvLine(text: string, key: string, value: string): string {
   return re.test(text) ? text.replace(re, line) : `${text.replace(/\n*$/, "\n")}${line}\n`;
 }
 
-/** The Wi-Fi listener answers, whatever its certificate (that's for the phone to check). */
-function lanHealth(): Promise<boolean> {
+/** Does the Wi-Fi listener answer at `host`, and with which certificate (SHA-256, lowercase hex)? */
+function lanProbe(host: string): Promise<{ answers: boolean; fingerprint?: string }> {
   return new Promise((resolve) => {
-    const req = https.get({ host: "127.0.0.1", port: config.lanPort, path: "/health", rejectUnauthorized: false, timeout: 3000 }, (res) => {
+    const req = https.get({ host, port: config.lanPort, path: "/health", rejectUnauthorized: false, timeout: 3000 }, (res) => {
+      const cert = (res.socket as import("node:tls").TLSSocket).getPeerCertificate?.();
+      const fingerprint = cert?.fingerprint256?.replace(/:/g, "").toLowerCase();
       res.resume();
-      resolve(res.statusCode === 200);
+      resolve({ answers: res.statusCode === 200, ...(fingerprint ? { fingerprint } : {}) });
     });
-    req.on("error", () => resolve(false));
+    req.on("error", () => resolve({ answers: false }));
     req.on("timeout", () => {
       req.destroy();
-      resolve(false);
+      resolve({ answers: false });
     });
   });
+}
+
+/** This Mac's own addresses on a local network (IPv4, on a real interface: not loopback, a tailnet or a tunnel). */
+export function lanAddresses(interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces()): string[] {
+  const out: string[] = [];
+  for (const [name, list] of Object.entries(interfaces)) {
+    if (!/^(en|bridge)\d/.test(name)) continue;
+    for (const a of list ?? []) {
+      const [first = 0, second = 0] = a.address.split(".").map(Number);
+      const tailnet = first === 100 && second >= 64 && second <= 127;
+      if (a.family === "IPv4" && !a.internal && !a.address.startsWith("169.254.") && !tailnet) out.push(a.address);
+    }
+  }
+  return out;
+}
+
+/** macOS's firewall, as far as it concerns the program that listens: off, letting it in, or blocking it. */
+function firewallFor(program: string): WifiProbe["firewall"] {
+  const tool = "/usr/libexec/ApplicationFirewall/socketfilterfw";
+  const state = run(tool, ["--getglobalstate"]);
+  if (!state.ok) return "unknown";
+  if (/disabled|State = 0/i.test(state.out)) return "off";
+  const app = run(tool, ["--getappblocked", program]);
+  if (!app.ok) return "unknown";
+  return /blocked/i.test(app.out) ? "blocked" : /permitted/i.test(app.out) ? "allowed" : "unknown";
+}
+
+/** What was found about the Wi-Fi side, for `wifiCheck` to judge. */
+export interface WifiProbe {
+  /** The Bonjour name the pairing code carries, e.g. Sams-MacBook.local. */
+  name: string;
+  nameAnswers: boolean;
+  /** Whether what answered showed this Mac's own certificate; null when nothing answered. */
+  ownCertificate: boolean | null;
+  /** This Mac's addresses on the local network, and whether the listener answers on each. */
+  addresses: { address: string; answers: boolean }[];
+  firewall: "off" | "allowed" | "blocked" | "unknown";
+  /** The program the firewall would be asked about. */
+  program: string;
+}
+
+/**
+ * The Wi-Fi check, from what was probed: the address the phone will use (the Mac's Bonjour name and
+ * its address on the network), not 127.0.0.1, which answered behind a blocking firewall and under a
+ * name nothing resolves. A Mac reaching itself still can't prove a phone can, and the line says so.
+ */
+export function wifiCheck(p: WifiProbe, port = config.lanPort): Check {
+  const what = "Wi-Fi";
+  const restart = `restart the daemon (\`${cliName} restart\`), then \`${cliName} doctor\` again`;
+  if (p.addresses.length === 0) return { ok: false, what, found: "this Mac has no address on a local network", fix: "join the Wi-Fi the phone is on (or plug in Ethernet on the same network)" };
+  const reached = p.addresses.filter((a) => a.answers).map((a) => a.address);
+  if (!p.nameAnswers && reached.length === 0) return { ok: false, what, found: `nothing answers on port ${port} at ${p.name} or ${p.addresses.map((a) => a.address).join(", ")}`, fix: restart };
+  if (p.ownCertificate === false) return { ok: false, what, found: `something else answers on port ${port}: its certificate isn't this Mac's`, fix: `stop the other program on port ${port}, or set another LAN_PORT in .env, then ${restart}` };
+  if (p.firewall === "blocked") return { ok: false, what, found: `the Mac's firewall blocks incoming connections to ${p.program}: the phone can't get in`, fix: "System Settings, Network, Firewall, Options: allow incoming connections for it" };
+  if (!p.nameAnswers) return { ok: false, what, found: `${p.name} (the name the pairing code carries) doesn't lead to this Mac, though ${reached.join(", ")} answers`, fix: `check the Local hostname under System Settings, General, Sharing, then run \`${cliName} pair\` for a fresh code` };
+  if (reached.length === 0) return { ok: false, what, found: `${p.name} answers, but not this Mac's address ${p.addresses.map((a) => a.address).join(", ")}`, fix: restart };
+  const caveat = p.firewall === "unknown" ? "; macOS may ask to allow it the first time the phone connects" : "";
+  return { ok: true, what, found: `answering at https://${p.name}:${port} (${reached.join(", ")})${caveat}. Checked from this Mac: a guest network that keeps devices apart can still shut the phone out` };
+}
+
+async function probeWifi(): Promise<WifiProbe> {
+  const name = localHostName();
+  const byName = await lanProbe(name);
+  const addresses = await Promise.all(lanAddresses().map(async (address) => ({ address, answers: (await lanProbe(address)).answers })));
+  let own: string | null = null;
+  try {
+    own = ensureTls().fingerprint;
+  } catch {
+    /* no certificate yet */
+  }
+  let program = process.execPath;
+  try {
+    program = fs.realpathSync(program);
+  } catch {
+    /* keep the path as given */
+  }
+  return { name, nameAnswers: byName.answers, ownCertificate: byName.fingerprint && own ? byName.fingerprint === own : null, addresses, firewall: firewallFor(program), program };
 }
 
 /** Does the push relay answer, with a key? */
@@ -251,21 +359,22 @@ export async function doctor(store: Store): Promise<Check[]> {
     fix: state ? `see the logs under ${path.join(config.dataDir, "logs")}` : "run `vibemachine setup` to install the LaunchAgent",
   });
   const ts = tailscale();
+  // Serving the tailnet with no iPhone on it and no Wi-Fi side: every other line is green and the phone can't get in.
+  const noPhoneOnTailnet = ts.running && ts.serving && ts.iosPeers === 0;
   checks.push({
-    ok: ts.installed && ts.running && ts.serving,
-    optional: true,
+    ok: ts.installed && ts.running && ts.serving && !(noPhoneOnTailnet && !config.lan),
+    optional: !(noPhoneOnTailnet && !config.lan),
     what: "Tailscale",
-    found: !ts.installed ? "not installed" : !ts.running ? "installed, not connected" : ts.serving ? `serving ${serverAddress(ts)}` : `connected as ${ts.dnsName ?? "?"}, not serving the daemon`,
-    fix: !ts.installed ? "install Tailscale on the Mac and the phone to reach the daemon away from home (https://tailscale.com)" : !ts.running ? "open Tailscale and sign in" : `run \`tailscale serve --bg --https=${config.port} http://${config.host}:${config.port}\` (or \`vibemachine setup\`)`,
+    found: !ts.installed ? "not installed" : !ts.running ? "installed, not connected" : ts.serving ? `serving ${serverAddress(ts)}${noPhoneOnTailnet ? ", but no iPhone is on your tailnet" : ""}` : `connected as ${ts.dnsName ?? "?"}, not serving the daemon`,
+    fix: !ts.installed ? "install Tailscale on the Mac and the phone to reach the daemon away from home (https://tailscale.com)" : !ts.running ? "open Tailscale and sign in" : ts.serving ? `put Tailscale on the iPhone and sign in to the same account, or run \`${cliName} setup --wifi\` to pair over the Wi-Fi` : `run \`tailscale serve --bg --https=${config.port} http://${config.host}:${config.port}\` (or \`vibemachine setup\`)`,
   });
   if (config.lan) {
-    const up = await lanHealth();
-    checks.push({ ok: up, what: "Wi-Fi", found: up ? `answering at ${lanAddress()}` : `LAN=1 but nothing answers on port ${config.lanPort}`, fix: "restart the daemon (`vibemachine setup`), and allow incoming connections for node if macOS asks" });
+    checks.push(wifiCheck(await probeWifi()));
   } else if (!(ts.installed && ts.running && ts.serving)) {
     checks.push({ ok: false, what: "Wi-Fi", found: "off, and no Tailscale: the phone has no way in", fix: "run `vibemachine setup --lan` to serve the phone on this Wi-Fi" });
   }
   const repos = gitRepos(config.projectsDir);
-  checks.push({ ok: repos > 0, what: "Projects", found: repos < 0 ? `${config.projectsDir} does not exist` : `${repos} git repos under ${config.projectsDir}`, fix: "set PROJECTS_DIR in .env to the folder your repos live in" });
+  checks.push({ ok: repos > 0, what: "Projects", found: repos < 0 ? `${config.projectsDir} does not exist` : `${repos} git repos under ${config.projectsDir}`, fix: `run \`${cliName} setup --projects <folder>\` with the folder your repos sit directly inside` });
   const phones = store.listDevices().filter((d) => !d.id.startsWith("cli-"));
   checks.push({ ok: phones.length > 0, optional: true, what: "Paired phones", found: phones.length > 0 ? phones.map((d) => d.name).join(", ") : "none yet", fix: "run `vibemachine pair` and scan the code with the app" });
   const apns = !!(config.apns.keyId && config.apns.teamId && config.apns.keyPath);
@@ -302,6 +411,27 @@ export interface SetupOptions {
   tailscale: boolean;
   /** Serve on the Wi-Fi: true, false, or undefined to decide (on when Tailscale isn't serving). */
   lan?: boolean;
+  /** `--wifi`: the phone has no Tailscale, so serve the Wi-Fi as well and put its address in the code. */
+  wifi?: boolean;
+  /** `--projects <folder>`: where the repos live, kept as PROJECTS_DIR. */
+  projects?: string;
+}
+
+/**
+ * The folder the phone lists repos from. Given on the command line it is taken as said; otherwise,
+ * when the one in use holds no git repo and someone is at the terminal, they are asked. Null leaves
+ * things as they are. A new user whose repos weren't in ~/dev used to reach the phone, tap +, and
+ * find nothing, with only "set PROJECTS_DIR in .env" to go on.
+ */
+export async function projectsFolder(opts: { projects?: string; dryRun?: boolean }, current: string, ask: ((question: string) => Promise<string>) | null): Promise<string | null> {
+  let wanted = opts.projects?.trim() ?? "";
+  if (!wanted && ask && !opts.dryRun && gitRepos(current) <= 0) {
+    wanted = (await ask(`No git repos directly inside ${current}. Which folder holds your projects? (Return to leave it) `)).trim();
+  }
+  if (!wanted) return null;
+  const folder = path.resolve(expandHome(wanted));
+  if (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) throw new Error(`${folder} isn't a folder`);
+  return folder === path.resolve(current) ? null : folder;
 }
 
 /** Install the daemon on this Mac and print how to pair the phone. */
@@ -321,12 +451,49 @@ export async function setup(store: Store, opts: SetupOptions): Promise<void> {
   const nodeOk = nodeCheck();
   if (!nodeOk.ok) throw new Error(`${nodeOk.found}: ${nodeOk.fix}`);
 
-  // The Wi-Fi listener: asked for, or needed because Tailscale isn't there to carry the phone.
+  // Where the repos are, before the daemon is (re)started, so it starts knowing.
+  const terminal = process.stdin.isTTY && process.stdout.isTTY ? createInterface({ input: process.stdin, output: process.stdout }) : null;
+  try {
+    const folder = await projectsFolder(opts, config.projectsDir, terminal ? (q) => terminal.question(q) : null);
+    if (folder) {
+      const found = gitRepos(folder);
+      say(`${opts.dryRun ? "would set" : "setting"} PROJECTS_DIR=${folder} in .env (${found > 0 ? `${found} git repos there` : "no git repos directly inside it yet"})`);
+      if (!opts.dryRun) {
+        fs.writeFileSync(envFile, setEnvLine(fs.readFileSync(envFile, "utf8"), "PROJECTS_DIR", folder));
+        // This run's own checks, further down, should look where the daemon will.
+        config.projectsDir = folder;
+      }
+    }
+  } finally {
+    terminal?.close();
+  }
+
+  // Tailscale Serve first (it can front a port nothing listens on yet), so what follows knows
+  // whether it took: a failed Serve used to leave a pairing code for 127.0.0.1.
+  if (opts.wifi && opts.lan === false) throw new Error(`--wifi needs the Wi-Fi side: leave out --no-lan`);
   const before = tailscale();
-  const lan = opts.lan ?? (config.lan || !(before.installed && before.running && (before.serving || opts.tailscale)));
+  let serveFailed = false;
+  if (opts.tailscale && before.installed && before.running && !before.serving) {
+    say(`${opts.dryRun ? "would run" : "running"} tailscale serve --bg --https=${config.port} http://${config.host}:${config.port}`);
+    if (!opts.dryRun) {
+      const r = run("tailscale", ["serve", "--bg", `--https=${config.port}`, `http://${config.host}:${config.port}`], 30_000);
+      if (!r.ok) {
+        serveFailed = true;
+        say(`  tailscale serve failed: ${r.out.split("\n")[0]}\n  (HTTPS certificates must be enabled for your tailnet: https://tailscale.com/kb/1153/enabling-https)\n  Carrying on with the Wi-Fi instead.`);
+      }
+    }
+  }
+  const served = opts.dryRun ? { ...before, serving: before.serving || (opts.tailscale && before.installed && before.running) } : serveFailed ? before : tailscale();
+  // The Wi-Fi listener: asked for, or needed because Tailscale isn't there to carry the phone: not
+  // serving, or serving a tailnet with no iPhone on it.
+  const lan = opts.lan ?? (config.lan || opts.wifi === true || !served.serving || served.iosPeers === 0);
   if (lan !== config.lan) {
     say(`${opts.dryRun ? "would set" : "setting"} LAN=${lan ? 1 : 0} in .env (${lan ? "the phone reaches this Mac on the Wi-Fi" : "Wi-Fi listener off"})`);
-    if (!opts.dryRun) fs.writeFileSync(envFile, setEnvLine(fs.readFileSync(envFile, "utf8"), "LAN", lan ? "1" : "0"));
+    if (!opts.dryRun) {
+      fs.writeFileSync(envFile, setEnvLine(fs.readFileSync(envFile, "utf8"), "LAN", lan ? "1" : "0"));
+      // This run's closing checks should test the Wi-Fi side the daemon is about to serve.
+      config.lan = lan;
+    }
   }
   if (lan && !opts.dryRun) ensureTls();
 
@@ -354,25 +521,73 @@ export async function setup(store: Store, opts: SetupOptions): Promise<void> {
     say(up ? `daemon answering on ${config.host}:${config.port}` : `daemon not answering yet; see ${path.join(logDir, "daemon.err.log")}`);
   }
 
-  const ts = tailscale();
-  if (opts.tailscale && ts.installed && ts.running && !ts.serving) {
-    say(`${opts.dryRun ? "would run" : "running"} tailscale serve --bg --https=${config.port} http://${config.host}:${config.port}`);
-    if (!opts.dryRun) {
-      const r = run("tailscale", ["serve", "--bg", `--https=${config.port}`, `http://${config.host}:${config.port}`], 30_000);
-      if (!r.ok) say(`  tailscale serve failed: ${r.out.split("\n")[0]}\n  (HTTPS certificates must be enabled for your tailnet: https://tailscale.com/kb/1153/enabling-https)`);
-    }
-  }
-
-  if (opts.dryRun) say(`\nwould print a pairing QR code for ${serverAddress(ts, lan)}`);
-  else await printPairing(store, pairingTarget(lan, tailscale()));
+  if (opts.dryRun) say(`\nwould print a pairing QR code for ${serverAddress(served, lan, prefersWifi(served, lan, opts.wifi))}`);
+  else await printPairing(store, pairingTarget(lan, served, opts.wifi));
   say("");
   printChecks(await doctor(store));
 }
 
 /** How this copy was installed: a git clone (updated by pulling) or a package (updated by npm). */
 export function installKind(root = daemonRoot): "clone" | "package" {
-  const r = spawnSync("git", ["-C", root, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" });
-  return r.status === 0 && r.stdout.trim() === "true" ? "clone" : "package";
+  // An installed package sits under node_modules whatever git work tree is around it (a home
+  // folder kept in git): pulling there would pull someone's dotfiles.
+  if (path.resolve(root).split(path.sep).includes("node_modules")) return "package";
+  const r = spawnSync("git", ["-C", root, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
+  if (r.status !== 0 || !r.stdout.trim()) return "package";
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  // The repo is this folder (the daemon's own repo) or the one just above it (the app's, with daemon/ inside).
+  const top = real(r.stdout.trim());
+  const here = real(root);
+  return top === here || top === path.dirname(here) ? "clone" : "package";
+}
+
+/**
+ * The npm prefix this copy was installed under (it sits at <prefix>/lib/node_modules/<package>),
+ * or null when it sits anywhere else. `update` installs there: the first npm on the PATH can
+ * belong to another Node (Homebrew's beside nvm's) and would put the new version where launchd
+ * never looks.
+ */
+export function installPrefix(root = daemonRoot): string | null {
+  let real = path.resolve(root);
+  try {
+    real = fs.realpathSync(real);
+  } catch {
+    /* keep the path as given */
+  }
+  const parts = real.split(path.sep);
+  const n = parts.length;
+  if (n < 4 || parts[n - 1] !== PACKAGE || parts[n - 2] !== "node_modules" || parts[n - 3] !== "lib") return null;
+  return parts.slice(0, n - 3).join(path.sep) || path.sep;
+}
+
+/**
+ * Waits until no session has been mid-turn for `quietMs` (each is a child of the daemon, and a
+ * restart stops it), checking every `pollMs`; false if `maxMs` passes first.
+ */
+export async function waitForIdle(live: () => number, opts: { pollMs?: number; quietMs?: number; maxMs?: number; sleep?: (ms: number) => Promise<void> } = {}): Promise<boolean> {
+  const pollMs = opts.pollMs ?? 5000;
+  const quietMs = opts.quietMs ?? 30_000;
+  const maxMs = opts.maxMs ?? 6 * 3600_000;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  let quiet = 0;
+  for (let waited = 0; waited <= maxMs; waited += pollMs) {
+    quiet = live() > 0 ? 0 : quiet + pollMs;
+    if (quiet >= quietMs) return true;
+    await sleep(pollMs);
+  }
+  return false;
+}
+
+/** `vibemachine restart --when-idle`: restart once no turn is running; a daemon that isn't answering is restarted at once. */
+export async function restartWhenIdle(live: () => number, say: (s: string) => void = (s) => console.log(s)): Promise<void> {
+  if ((await health()).ok && !(await waitForIdle(live))) return say("still busy after six hours: not restarting");
+  restartDaemon(say);
 }
 
 /** The LaunchAgent's plist, if `vibemachine setup` installed one. */
@@ -382,8 +597,8 @@ function installedPlist(): { label: string; plist: string } | null {
   return fs.existsSync(plist) ? { label, plist } : null;
 }
 
-/** Restart the installed daemon so it runs the code now on disk. */
-function restartDaemon(say: (s: string) => void): void {
+/** Restart the installed daemon so it runs the code now on disk, with the settings now in .env. */
+export function restartDaemon(say: (s: string) => void = (s) => console.log(s)): void {
   const agent = installedPlist();
   if (!agent) return say(`no LaunchAgent installed: run \`${cliName} setup\``);
   const uid = process.getuid?.() ?? 501;
@@ -396,7 +611,7 @@ function restartDaemon(say: (s: string) => void): void {
  * (its .env and data live in the data folder, so nothing is lost); a clone pulls, installs and
  * builds. Sessions running on the phone are stopped by the restart and resume on their next prompt.
  */
-export async function update(opts: { dryRun?: boolean } = {}): Promise<void> {
+export async function update(opts: { dryRun?: boolean; now?: boolean; live?: () => number } = {}): Promise<void> {
   const say = (s: string) => console.log(s);
   const kind = installKind();
   const step = (cmd: string, args: string[], cwd = daemonRoot): void => {
@@ -406,20 +621,42 @@ export async function update(opts: { dryRun?: boolean } = {}): Promise<void> {
     if (r.status !== 0) throw new Error(`${cmd} ${args.join(" ")} failed`);
   };
   if (kind === "package") {
-    const latest = run("npm", ["view", "vibemachine", "version"], 30_000);
+    // The package is vibemachine-daemon; the command it installs is vibemachine. Asking npm about
+    // the command's name got a 404, so every update reinstalled and restarted (audit D1).
+    const latest = run("npm", ["view", PACKAGE, "version"], 30_000);
     const newest = latest.ok ? latest.out.split("\n").pop()!.trim() : null;
     if (newest && newest === packageVersion) {
       say(`vibemachine ${packageVersion} is the newest`);
       return;
     }
     say(`vibemachine ${packageVersion}${newest ? ` → ${newest}` : ""}`);
-    step("npm", ["install", "-g", "vibemachine-daemon@latest", "--no-fund", "--no-audit"], os.homedir());
+    // Into the prefix this copy runs from, with that prefix's own npm where it has one.
+    const prefix = installPrefix();
+    const npm = prefix && fs.existsSync(path.join(prefix, "bin", "npm")) ? path.join(prefix, "bin", "npm") : "npm";
+    if (!prefix) say(`note: this copy isn't in an npm prefix (${daemonRoot}); installing with the first npm found`);
+    step(npm, ["install", "-g", ...(prefix ? ["--prefix", prefix] : []), `${PACKAGE}@latest`, "--no-fund", "--no-audit"], os.homedir());
+    if (!opts.dryRun) {
+      let now: string | null = null;
+      try {
+        now = (JSON.parse(fs.readFileSync(path.join(daemonRoot, "package.json"), "utf8")) as { version?: string }).version ?? null;
+      } catch {
+        /* reported below */
+      }
+      if (newest && now !== newest) throw new Error(`npm finished, but ${daemonRoot} is still ${now ?? "unreadable"}: the daemon would keep running the old version`);
+    }
   } else {
     step("git", ["pull", "--ff-only"]);
     step("npm", ["install", "--no-fund", "--no-audit"]);
     step("npm", ["run", "build", "--silent"]);
   }
-  if (!opts.dryRun) restartDaemon(say);
+  if (opts.dryRun) return;
+  // A restart stops every turn in flight (each is a child of the daemon): wait for a quiet moment
+  // unless told otherwise. The waiting is done by a process of its own, so this one can return.
+  const live = opts.now ? 0 : (opts.live?.() ?? 0);
+  if (live === 0) return restartDaemon(say);
+  say(`${live} ${live === 1 ? "session is" : "sessions are"} mid-turn: the new version starts by itself when ${live === 1 ? "it finishes" : "they finish"}.`);
+  say(`  To switch now and stop ${live === 1 ? "it" : "them"}: ${cliName} restart`);
+  spawn(path.join(daemonRoot, "bin", "vibemachine"), ["restart", "--when-idle"], { detached: true, stdio: "ignore", env: { ...process.env, PATH: toolPath } }).unref();
 }
 
 /**
@@ -456,6 +693,6 @@ export function uninstall(opts: { purge?: boolean; dryRun?: boolean } = {}): voi
     say(`  \`${cliName} uninstall --purge\` deletes it too.`);
   }
   say(`\nThe phone's pairing ends with the daemon; in the app, Settings → Forget this Mac.`);
-  if (installKind() === "package") say(`To remove the command itself: npm uninstall -g vibemachine-daemon`);
+  if (installKind() === "package") say(`To remove the command itself: npm uninstall -g ${PACKAGE}`);
   say(`Claude Code and its own sessions (~/.claude) are untouched.`);
 }

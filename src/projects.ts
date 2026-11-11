@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { config } from "./config.js";
-import { PROJECT_FILE } from "./project.js";
+import { previewSummary } from "./project.js";
 
 const run = promisify(execFile);
 
@@ -15,7 +15,7 @@ export interface Project {
   branch: string | null;
   /** The last commit's date (ISO), when there is one. */
   last_commit: string | null;
-  /** Has a .vibemachine.json, so builds get screenshots. */
+  /** Builds get screenshots: an iPhone app the daemon found, or a .vibemachine.json. */
   preview: boolean;
 }
 
@@ -31,7 +31,7 @@ export async function listProjects(root = config.projectsDir): Promise<Project[]
     repos.map(async (e): Promise<Project> => {
       const cwd = path.join(root, e.name);
       const [branch, last] = await Promise.all([git(cwd, "rev-parse", "--abbrev-ref", "HEAD"), git(cwd, "log", "-1", "--format=%cI")]);
-      return { name: e.name, cwd, branch, last_commit: last, preview: fs.existsSync(path.join(cwd, PROJECT_FILE)) };
+      return { name: e.name, cwd, branch, last_commit: last, preview: previewSummary(cwd) !== null };
     }),
   );
   return projects.sort((a, b) => (b.last_commit ?? "").localeCompare(a.last_commit ?? ""));

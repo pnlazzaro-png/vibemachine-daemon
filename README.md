@@ -6,6 +6,15 @@ phone asks, and streams each one to the app: the replies, the tool calls,
 the permission prompts you answer from the phone, the commits and builds,
 and screenshots of what changed.
 
+![Vibe Machine on an iPhone Duo: the stream on the left, where Claude waits for permission to run a build command, and a before-and-after of the app on the right](https://getvibemachine.com/img/shots/cockpit-waiting.webp)
+
+Just curious what your Claude Code sessions have cost? This needs no phone
+and no setup, and sends nothing anywhere:
+
+```bash
+npx vibemachine-daemon stats week    # or today, month, year, all
+```
+
 Vibe Machine is independent and is not affiliated with, endorsed by or
 sponsored by Anthropic. Claude and Claude Code are trademarks of Anthropic.
 
@@ -36,10 +45,15 @@ Tailscale Serve when Tailscale is connected (or serves the Wi-Fi when it
 isn't), and prints a QR code. Open Vibe Machine on the phone and scan it, or
 point the iPhone's Camera at it.
 
+Tailscale on the Mac but not on the iPhone? A tailnet address is one the
+phone can't reach. `setup` notices when no iPhone is on your tailnet and
+serves the Wi-Fi as well, with the Wi-Fi address in the code; `vibemachine
+setup --wifi` asks for that outright.
+
 ```bash
 vibemachine doctor      # checks everything the phone needs; each ✗ comes with a fix
 vibemachine pair        # a fresh pairing code, if the first one expired
-vibemachine update      # the newest release, then a restart
+vibemachine update      # the newest release; restarts once no turn is running (--now: at once)
 vibemachine uninstall   # removes the LaunchAgent; --purge removes the data too
 vibemachine help        # every command, including sessions, stats and allow/deny from the terminal
 ```
@@ -100,7 +114,7 @@ each. The ones people change:
 | `PERMISSION_MODE` | The mode new sessions start in. `default` sends every permission prompt to the phone. |
 | `DEFAULT_MODEL` | Empty for Claude Code's own default. |
 | `IDLE_MINUTES` | An idle session's process stops after this long; the next prompt resumes it. |
-| `LAN`, `LAN_PORT` | The Wi-Fi listener. `setup` turns it on when Tailscale isn't serving. |
+| `LAN`, `LAN_PORT` | The Wi-Fi listener. `setup` turns it on when Tailscale isn't serving, or serves a tailnet with no iPhone on it. |
 | `CLAUDE_BIN` | Where `claude` is, if the daemon can't find it. |
 | `ANTHROPIC_API_KEY` | Bill sessions to an API key instead of your sign-in. |
 
@@ -137,6 +151,19 @@ the daemon on loopback and use the `vibemachine` command's own key, the same
 way it could run `claude` itself. Pair only phones you own, and forget a
 phone you no longer have (Settings in the app, or `vibemachine devices` and
 `vibemachine forget <id>`).
+
+Only start sessions in repos you trust. In a terminal, Claude Code asks
+whether you trust a folder the first time you open it there. Started from
+the phone it runs without a terminal and that question is skipped (its own
+help says of this mode: "Only use this in directories you trust"). So a
+repo's own Claude Code settings take effect with nobody asked: the hooks in
+its `.claude/settings.json` run, and the MCP servers in its `.mcp.json` are
+started, as soon as a session begins there, before any prompt reaches the
+phone. Its allow rules are the exception: Claude Code ignores them until
+you have opened that folder with `claude` in a terminal and accepted the
+trust question once, and from then on a command they cover runs without
+asking the phone. (Checked with Claude Code 2.1.321.) Read those two files
+in a repo you didn't write before you start a session in it.
 
 ## Support
 

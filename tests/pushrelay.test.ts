@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { config } from "../src/config.js";
 import { relaySend, type Transport } from "../src/push.js";
-import { createRelay, parseRelayRequest, PAYLOAD_MAX, RateLimit } from "../src/pushrelay.js";
+import { callerKey, createRelay, parseRelayRequest, PAYLOAD_MAX, RateLimit } from "../src/pushrelay.js";
 
 const TOKEN = "ab".repeat(32);
 const PAYLOAD = JSON.stringify({ aps: { alert: { title: "t", body: "b" } } });
@@ -87,4 +87,31 @@ test("relay: the caller's address comes from the socket, or the proxy's own head
   assert.equal(await post2("5.5.5.5"), 200);
   assert.equal(await post2("5.5.5.5"), 429, "the same caller, by the proxy's header");
   assert.equal(await post2("6.6.6.6"), 200, "another caller, by the proxy's header");
+});
+
+test("RateLimit: quiet keys are swept once a window, and a flood of new keys can't grow the map", () => {
+  const r = new RateLimit(2, 1000, 3);
+  assert.equal(r.allow("a", 0), true);
+  assert.equal(r.allow("b", 10), true);
+  assert.equal(r.allow("c", 20), true);
+  assert.equal(r.size, 3);
+  // Full: a key not seen before is refused, the known ones carry on.
+  assert.equal(r.allow("d", 30), false);
+  assert.equal(r.allow("a", 40), true);
+  assert.equal(r.size, 3);
+  // A window later the quiet ones are gone, without waiting for ten thousand of them.
+  assert.equal(r.allow("d", 1100), true);
+  assert.equal(r.size, 1);
+});
+
+test("callerKey: an IPv6 caller is its /64, an IPv4 caller itself, mapped or not", () => {
+  assert.equal(callerKey("203.0.113.7"), "203.0.113.7");
+  assert.equal(callerKey("::ffff:203.0.113.7"), "203.0.113.7");
+  assert.equal(callerKey("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), "2001:db8:1:2::/64");
+  assert.equal(callerKey("2001:db8:1:2::1"), callerKey("2001:0db8:0001:0002:ffff:ffff:ffff:ffff"));
+  assert.notEqual(callerKey("2001:db8:1:2::1"), callerKey("2001:db8:1:3::1"));
+  assert.equal(callerKey("2001:db8::1"), "2001:db8:0:0::/64");
+  assert.equal(callerKey("::1"), "0:0:0:0::/64");
+  assert.equal(callerKey("fe80::1%en0"), "fe80:0:0:0::/64");
+  assert.equal(callerKey(""), "?");
 });

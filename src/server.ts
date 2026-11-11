@@ -22,6 +22,8 @@
 //   GET  /stats?since=&until=&bucket=day|month&project=   the usage ledger for a span (stats.ts)
 //   POST /diagnostics                      a MetricKit payload from the phone (crashes, hangs), kept under DATA_DIR/diagnostics
 //   POST /devices/me/push                 {token, environment} APNs device token (or token: null)
+//   GET  /devices/me/notifications        which pushes this phone gets: {kinds: {permission, turn_done, stopped, shipped, build_failed}}
+//   POST /devices/me/notifications        {kinds: {…}} any of them, true or false; answers with them all
 //   POST /devices/me/activity              {kind: "start"|"update", token, environment, session_id?} ActivityKit tokens
 //   GET  /install/:token/...               (no auth) an ad hoc build for the phone: ios/scripts/adhoc.sh
 //   GET  /ws                               WebSocket, same signed headers
@@ -43,7 +45,7 @@ import { EFFORT_LEVELS, RefusedError, UnavailableError } from "./claude.js";
 import { config, packageVersion } from "./config.js";
 import type { EventRow, Store } from "./db.js";
 import { saveDiagnostic } from "./diagnostics.js";
-import { Notifier } from "./notifier.js";
+import { Notifier, PUSH_KINDS, pushKinds } from "./notifier.js";
 import { STAGES, STAGE_STATUSES, type PipelineLine, type Stage, type StageStatus } from "./pipeline.js";
 import { clipPath, servedCopy } from "./preview.js";
 import { listProjects } from "./projects.js";
@@ -173,10 +175,39 @@ function publicEvent(row: EventRow): Json {
 const viaLan = new WeakSet<http.IncomingMessage>();
 
 export function startServer(store: Store, sessions: SessionManager, ledger?: UsageLedger): http.Server {
-  // Who is watching what, so a phone with the session on screen isn't also pushed.
-  const subscriptions = new Map<WebSocket, { deviceId: string; sessions: Set<string> }>();
-  const watching = (deviceId: string, sessionId: string): boolean => {
-    for (const [ws, sub] of subscriptions) if (sub.deviceId === deviceId && sub.sessions.has(sessionId) && ws.readyState === WebSocket.OPEN) return true;
+  // Who is watching what, so a phone with the session on screen isn't also pushed. An open socket
+  // isn't proof: a phone that left the Wi-Fi, or whose app was suspended, stays OPEN here until TCP
+  // or the tailnet's proxy gives up, minutes later, and every push in between was skipped. So a
+  // phone counts as watching only if it has answered a ping lately, and when that was more than a
+  // few seconds ago it is asked again, there and then, before a push is held back for it.
+  const subscriptions = new Map<WebSocket, { deviceId: string; sessions: Set<string>; lastPong: number }>();
+  const FRESH_MS = 5_000;
+  const PROBE_MS = 2_000;
+  const SILENT_MS = 70_000;
+  const answers = (ws: WebSocket): Promise<boolean> =>
+    new Promise((resolve) => {
+      const onPong = (): void => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      const timer = setTimeout(() => {
+        ws.off("pong", onPong);
+        resolve(false);
+      }, PROBE_MS);
+      ws.once("pong", onPong);
+      try {
+        ws.ping();
+      } catch {
+        clearTimeout(timer);
+        ws.off("pong", onPong);
+        resolve(false);
+      }
+    });
+  const watching = async (deviceId: string, sessionId: string): Promise<boolean> => {
+    for (const [ws, sub] of subscriptions) {
+      if (sub.deviceId !== deviceId || !sub.sessions.has(sessionId) || ws.readyState !== WebSocket.OPEN) continue;
+      if (Date.now() - sub.lastPong < FRESH_MS || (await answers(ws))) return true;
+    }
     return false;
   };
   const notifier = new Notifier(store, watching);
@@ -279,6 +310,22 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
       if (!validToken(json.token)) throw new HttpError(400, "token must be hex");
       store.setPushToken(auth.deviceId!, json.token.toLowerCase(), environmentFrom(json.environment));
       return sendJson(res, 200, { ok: true, push: notifier.enabled });
+    }
+    if (url.pathname === "/devices/me/notifications" && method === "GET") {
+      return sendJson(res, 200, { kinds: pushKinds(store.getDevice(auth.deviceId!)?.push_kinds) });
+    }
+    if (url.pathname === "/devices/me/notifications" && method === "POST") {
+      const asked = parseJson(body).kinds;
+      if (!asked || typeof asked !== "object" || Array.isArray(asked)) throw new HttpError(400, "kinds must be an object");
+      const kinds = pushKinds(store.getDevice(auth.deviceId!)?.push_kinds);
+      for (const kind of PUSH_KINDS) {
+        const v = (asked as Record<string, unknown>)[kind];
+        if (v === undefined) continue;
+        if (typeof v !== "boolean") throw new HttpError(400, `${kind} must be true or false`);
+        kinds[kind] = v;
+      }
+      store.setPushKinds(auth.deviceId!, JSON.stringify(kinds));
+      return sendJson(res, 200, { kinds });
     }
     if (url.pathname === "/devices/me/activity" && method === "POST") {
       const json = parseJson(body);
@@ -476,7 +523,9 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
   });
 
   wss.on("connection", (ws: WebSocket, deviceId: string) => {
-    subscriptions.set(ws, { deviceId, sessions: new Set() });
+    const sub = { deviceId, sessions: new Set<string>(), lastPong: Date.now() };
+    subscriptions.set(ws, sub);
+    ws.on("pong", () => { sub.lastPong = Date.now(); });
     ws.send(JSON.stringify({ type: "hello", ...versionFields(), sessions: sessions.list() }));
     ws.on("message", (data) => {
       let msg: Json;
@@ -513,6 +562,8 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
       } else if (msg.type === "unsubscribe" && sessionId) {
         subscriptions.get(ws)?.sessions.delete(sessionId);
       } else if (msg.type === "ping") {
+        // The app's own ping is as good as a pong: it is there.
+        sub.lastPong = Date.now();
         ws.send(JSON.stringify({ type: "pong" }));
       }
     });
@@ -556,9 +607,13 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
   else if (config.pushRelay) console.log(`push: through the relay at ${config.pushRelay}`);
   else console.log("push: off (set APNS_KEY_ID, APNS_TEAM_ID, APNS_KEY_PATH)");
 
-  // Keep idle sockets alive through Tailscale Serve.
+  // Keep idle sockets alive through Tailscale Serve, and drop the ones that stopped answering.
   const heartbeat = setInterval(() => {
-    for (const ws of subscriptions.keys()) if (ws.readyState === WebSocket.OPEN) ws.ping();
+    for (const [ws, sub] of subscriptions) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      if (Date.now() - sub.lastPong > SILENT_MS) ws.terminate();
+      else ws.ping();
+    }
   }, 25_000);
   heartbeat.unref();
 

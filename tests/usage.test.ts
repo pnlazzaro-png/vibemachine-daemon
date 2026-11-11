@@ -141,7 +141,7 @@ test("report: totals, the span before, buckets with empty days, projects, stages
   assert.deepEqual(r.stages.build, { done: 0, failed: 1, open: 0 });
   assert.equal(r.sources[0]!.source, "terminal");
   assert.equal(r.tools[0]!.tool, "Bash");
-  assert.ok(r.scores.some((s) => s.label === "dearest turn"));
+  assert.ok(r.scores.some((s) => s.label === "most expensive turn"));
   assert.ok(r.scores.some((s) => s.label === "streak" && s.value === "1 day"));
   // The punch card: the one prompt, at its local weekday and hour.
   const asked = new Date("2026-10-20T15:00:00.000Z");
@@ -187,12 +187,12 @@ test("scores: the fastest ship, the cheapest useful turn, the longest think, int
   assert.equal(score("fastest ship")?.n, 4 * 60_000);
   assert.equal(score("fastest ship")?.better, "low");
   assert.equal(score("cheapest useful turn")?.detail.split(" · ")[1], "Ship the fix");
-  assert.ok((score("cheapest useful turn")?.n ?? 0) < (score("dearest turn")?.n ?? 0));
+  assert.ok((score("cheapest useful turn")?.n ?? 0) < (score("most expensive turn")?.n ?? 0));
   assert.equal(score("longest think")?.value, "5k tokens");
   assert.equal(score("most interrupted")?.value, "2 interrupts");
   assert.equal(score("night owl")?.value, "11:30 PM");
   assert.equal(score("first light")?.value, "6:10 AM");
-  assert.equal(score("dearest turn")?.project, "thing");
+  assert.equal(score("most expensive turn")?.project, "thing");
   assert.equal(score("streak")?.project, null);
 
   // The record check the Live Activity makes: nothing shipped before the first prompt; the four minutes after it.
@@ -296,7 +296,7 @@ test("repos: every project's commits ever from git, Claude's among them; the spa
   fs.rmSync(repo, { recursive: true, force: true });
 });
 
-test("scores: the best combo, the commit spree, the tool frenzy and the marathon turn", async () => {
+test("scores: the best combo, the commit spree, the tool frenzy and the longest turn", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "vm-usage-"));
   const dir = path.join(root, "-Users-sam-dev-thing");
   fs.mkdirSync(dir);
@@ -333,7 +333,9 @@ test("scores: the best combo, the commit spree, the tool frenzy and the marathon
   assert.equal(score("tool frenzy")?.value, "12 tools");
   assert.equal(score("tool frenzy")?.detail.split(" · ")[2], "Clean up");
   // Ten minutes to the first call, the hour's gap capped at ten: twenty.
-  assert.equal(score("marathon turn")?.value, "20m 00s");
-  assert.equal(score("marathon turn")?.n, 20 * 60_000);
+  assert.equal(score("longest turn")?.value, "20m 00s");
+  assert.equal(score("longest turn")?.n, 20 * 60_000);
+  // The table opens with the most expensive and the longest, turn then session.
+  assert.deepEqual(r.scores.slice(0, 4).map((s) => s.label), ["most expensive turn", "most expensive session", "longest turn", "longest session"]);
   fs.rmSync(root, { recursive: true, force: true });
 });

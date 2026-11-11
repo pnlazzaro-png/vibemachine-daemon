@@ -2,15 +2,21 @@
 // phone, with its own P-256 key in the data directory, so every call takes
 // the same signed path the app does.
 //
-//   vm setup [--dry-run] [--no-tailscale] [--lan|--no-lan]   install the LaunchAgent, front it with Tailscale
-//                                 or serve the Wi-Fi, print a pairing QR code
+//   vm setup [--dry-run] [--no-tailscale] [--lan|--no-lan] [--wifi] [--projects <folder>]
+//                                 install and start the daemon, print a pairing QR code; --projects
+//                                 says where your repos live (asked, if ~/dev has none); --wifi when
+//                                 the Mac has Tailscale and the phone doesn't
+//   vm restart [--when-idle]      restart the daemon, after a change to its .env; --when-idle waits
+//                                 until no turn is running
 //   vm doctor                     check Node, Claude Code's sign-in, the daemon, Tailscale, projects, pushes
-//   vm update [--dry-run]         the newest release (npm, or a pull in a clone), then a restart
+//   vm update [--dry-run] [--now] the newest release (npm, or a pull in a clone), then a restart once
+//                                 no turn is running (--now: at once, stopping them)
 //   vm uninstall [--purge] [--dry-run]   remove the LaunchAgent and its Tailscale rule; --purge the data too
 //   vibemachine daemon                     run the daemon in the foreground (what the LaunchAgent runs; bin/vibemachine)
 //
 // Installed from npm the command is `vibemachine`; a clone also has `bin/vm`.
-//   vm pair                       print a pairing code and QR code for the phone
+//   vm pair [--wifi]              print a pairing code and QR code for the phone (--wifi: for the Wi-Fi,
+//                                 when Tailscale also serves the daemon)
 //   vm devices                    list enrolled devices
 //   vm forget <device-id>
 //   vm sessions
@@ -26,6 +32,7 @@
 //   vm preview <id>               screenshot the project's app in the simulator now
 //   vm tail <id> [since]          follow the stream (summarised)
 //   vm stats [today|week|month|year|all] [project]   the usage ledger: every session on this Mac
+//                                 (with no daemon running it reads Claude Code's transcripts itself)
 //   vm export-demo <id> <dir>     one session, its captures, projects and stats as the app's bundled demo
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import fs from "node:fs";
@@ -36,7 +43,9 @@ import { signingString } from "./auth.js";
 import { cliName, config } from "./config.js";
 import { Store } from "./db.js";
 import { exportDemo } from "./demo.js";
-import { doctor, pairingTarget, printChecks, printPairing, setup, uninstall, update } from "./setup.js";
+import { doctor, pairingTarget, printChecks, printPairing, restartDaemon, restartWhenIdle, setup, uninstall, update } from "./setup.js";
+import { statsReport, type StatsQuery } from "./stats.js";
+import { UsageLedger } from "./usage.js";
 
 const base = `http://${config.host}:${config.port}`;
 const keyFile = path.join(config.dataDir, "cli-device.json");
@@ -122,16 +131,97 @@ function summarise(ev: Record<string, unknown>): string | null {
   return null;
 }
 
+/** What `stats` prints of a report (stats.ts writes the same names). */
+interface PrintableStats {
+  totals: { cost_usd: number; tokens: number; cache_read: number; prompts: number; sessions: number; tools: number; unpriced: number };
+  previous: { cost_usd: number } | null;
+  series: { bucket: string; cost_usd: number; prompts: number }[];
+  models: { model: string; cost_usd: number; requests: number }[];
+  projects: { name: string; cost_usd: number; prompts: number; commits: number; builds: number; builds_failed: number }[];
+  repos?: { name: string; commits: number; claude: number }[];
+  sources: { source: string; cost_usd: number; sessions: number }[];
+  scores: { label: string; value: string; detail: string }[];
+}
+
+/** `stats [today|week|month|year|all] [project]` as the range's name and the ledger's query. */
+function statsQuery(args: string[], now = new Date()): { range: string; q: StatsQuery } {
+  const [range = "today", project] = args;
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  if (range === "week") start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
+  else if (range === "month") start.setDate(1);
+  else if (range === "year") start.setMonth(0, 1);
+  return { range, q: { since: range === "all" ? null : start.toISOString(), until: null, bucket: range === "year" || range === "all" ? "month" : "day", cwd: project ? path.resolve(project) : null } };
+}
+
+function printStats(range: string, r: PrintableStats): void {
+  const t = r.totals;
+  const cache = t.tokens > 0 ? Math.round((t.cache_read / t.tokens) * 100) : 0;
+  console.log(`${range}: $${t.cost_usd.toFixed(2)}${r.previous ? ` (before: $${r.previous.cost_usd.toFixed(2)})` : ""}  ${(t.tokens / 1e6).toFixed(1)}M tokens, ${cache}% from cache  ${t.prompts} prompts, ${t.tools} tool calls, ${t.sessions} sessions${t.unpriced ? `  (${t.unpriced} calls on models without a price)` : ""}`);
+  for (const m of r.models) console.log(`  ${m.model.padEnd(24)} $${m.cost_usd.toFixed(2).padStart(8)}  ${m.requests} calls`);
+  console.log("projects:");
+  for (const p of r.projects) console.log(`  ${p.name.padEnd(24)} $${p.cost_usd.toFixed(2).padStart(8)}  ${p.prompts} prompts, ${p.commits} commits, ${p.builds} builds${p.builds_failed ? ` (${p.builds_failed} failed)` : ""}`);
+  if (r.repos?.length) {
+    console.log("commits, all time:");
+    for (const p of r.repos) console.log(`  ${p.name.padEnd(24)} ${String(p.commits).padStart(6)}  (${p.claude} with Claude)`);
+  }
+  console.log("sources: " + r.sources.map((s) => `${s.source} $${s.cost_usd.toFixed(2)} (${s.sessions})`).join(", "));
+  for (const s of r.scores) console.log(`  ${s.label.padEnd(24)} ${s.value.padEnd(12)} ${s.detail}`);
+  const active = r.series.filter((b) => b.cost_usd > 0 || b.prompts > 0);
+  if (active.length > 1) for (const b of active) console.log(`  ${b.bucket}  $${b.cost_usd.toFixed(2).padStart(8)}  ${b.prompts} prompts`);
+}
+
+/** Whether a daemon is answering on this Mac (its health check takes no signature). */
+async function daemonAnswers(): Promise<boolean> {
+  try {
+    return (await fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) })).ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `stats` with no daemon running: read Claude Code's transcripts into a ledger held in memory and
+ * print the same report. Nothing is set up or enrolled and nothing is kept, so it works straight
+ * from `npx vibemachine-daemon stats week` on a Mac that has never seen Vibe Machine.
+ */
+async function statsWithoutDaemon(args: string[]): Promise<void> {
+  const { range, q } = statsQuery(args);
+  const memory = new Store(":memory:");
+  try {
+    const ledger = new UsageLedger(memory);
+    if (!fs.existsSync(ledger.root)) {
+      console.log(`No Claude Code transcripts on this Mac yet (${ledger.root}). Run claude once and come back.`);
+      return;
+    }
+    await ledger.scan();
+    printStats(range, statsReport(memory, q) as unknown as PrintableStats);
+    console.log(`\nRead from Claude Code's transcripts on this Mac (${ledger.root}); costs are at API list prices. Nothing was sent anywhere.`);
+    console.log("The same on your iPhone, with every turn as it happens: https://getvibemachine.com");
+  } finally {
+    memory.close();
+  }
+}
+
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
+  if (cmd === "stats" && !(await daemonAnswers())) return statsWithoutDaemon(rest);
   const store = new Store();
   try {
     if (cmd === "setup") {
-      await setup(store, { dryRun: rest.includes("--dry-run"), tailscale: !rest.includes("--no-tailscale"), ...(rest.includes("--lan") ? { lan: true } : rest.includes("--no-lan") ? { lan: false } : {}) });
+      const at = rest.indexOf("--projects");
+      const projects = at >= 0 ? rest[at + 1] : undefined;
+      if (at >= 0 && (!projects || projects.startsWith("--"))) throw new Error(`usage: ${cliName} setup --projects <folder>`);
+      await setup(store, { dryRun: rest.includes("--dry-run"), tailscale: !rest.includes("--no-tailscale"), ...(rest.includes("--lan") ? { lan: true } : rest.includes("--no-lan") ? { lan: false } : {}), ...(rest.includes("--wifi") ? { wifi: true } : {}), ...(projects ? { projects } : {}) });
+      return;
+    }
+    if (cmd === "restart") {
+      if (rest.includes("--when-idle")) await restartWhenIdle(() => store.liveSessions());
+      else restartDaemon();
       return;
     }
     if (cmd === "update") {
-      await update({ dryRun: rest.includes("--dry-run") });
+      await update({ dryRun: rest.includes("--dry-run"), now: rest.includes("--now"), live: () => store.liveSessions() });
       return;
     }
     if (cmd === "uninstall") {
@@ -143,7 +233,7 @@ async function main(): Promise<void> {
       return;
     }
     if (cmd === "pair") {
-      await printPairing(store, pairingTarget());
+      await printPairing(store, pairingTarget(undefined, undefined, rest.includes("--wifi") ? true : undefined));
       return;
     }
     if (cmd === "devices") {
@@ -218,40 +308,11 @@ async function main(): Promise<void> {
       return;
     }
     if (cmd === "stats") {
-      const [range = "today", project] = rest;
-      const now = new Date();
-      const start = new Date(now);
-      start.setHours(0, 0, 0, 0);
-      if (range === "week") start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
-      else if (range === "month") start.setDate(1);
-      else if (range === "year") start.setMonth(0, 1);
-      const query = new URLSearchParams({ bucket: range === "year" || range === "all" ? "month" : "day" });
-      if (range !== "all") query.set("since", start.toISOString());
-      if (project) query.set("project", path.resolve(project));
-      const r = (await call(key, "GET", `/stats?${query}`)) as {
-        totals: { cost_usd: number; tokens: number; cache_read: number; prompts: number; sessions: number; tools: number; unpriced: number };
-        previous: { cost_usd: number } | null;
-        series: { bucket: string; cost_usd: number; prompts: number }[];
-        models: { model: string; cost_usd: number; requests: number }[];
-        projects: { name: string; cost_usd: number; prompts: number; commits: number; builds: number; builds_failed: number }[];
-        repos?: { name: string; commits: number; claude: number }[];
-        sources: { source: string; cost_usd: number; sessions: number }[];
-        scores: { label: string; value: string; detail: string }[];
-      };
-      const t = r.totals;
-      const cache = t.tokens > 0 ? Math.round((t.cache_read / t.tokens) * 100) : 0;
-      console.log(`${range}: $${t.cost_usd.toFixed(2)}${r.previous ? ` (before: $${r.previous.cost_usd.toFixed(2)})` : ""}  ${(t.tokens / 1e6).toFixed(1)}M tokens, ${cache}% from cache  ${t.prompts} prompts, ${t.tools} tool calls, ${t.sessions} sessions${t.unpriced ? `  (${t.unpriced} calls on models without a price)` : ""}`);
-      for (const m of r.models) console.log(`  ${m.model.padEnd(24)} $${m.cost_usd.toFixed(2).padStart(8)}  ${m.requests} calls`);
-      console.log("projects:");
-      for (const p of r.projects) console.log(`  ${p.name.padEnd(24)} $${p.cost_usd.toFixed(2).padStart(8)}  ${p.prompts} prompts, ${p.commits} commits, ${p.builds} builds${p.builds_failed ? ` (${p.builds_failed} failed)` : ""}`);
-      if (r.repos?.length) {
-        console.log("commits, all time:");
-        for (const p of r.repos) console.log(`  ${p.name.padEnd(24)} ${String(p.commits).padStart(6)}  (${p.claude} with Claude)`);
-      }
-      console.log("sources: " + r.sources.map((s) => `${s.source} $${s.cost_usd.toFixed(2)} (${s.sessions})`).join(", "));
-      for (const s of r.scores) console.log(`  ${s.label.padEnd(22)} ${s.value.padEnd(12)} ${s.detail}`);
-      const active = r.series.filter((b) => b.cost_usd > 0 || b.prompts > 0);
-      if (active.length > 1) for (const b of active) console.log(`  ${b.bucket}  $${b.cost_usd.toFixed(2).padStart(8)}  ${b.prompts} prompts`);
+      const { range, q } = statsQuery(rest);
+      const query = new URLSearchParams({ bucket: q.bucket });
+      if (q.since) query.set("since", q.since);
+      if (q.cwd) query.set("project", q.cwd);
+      printStats(range, (await call(key, "GET", `/stats?${query}`)) as PrintableStats);
       return;
     }
     if (cmd === "export-demo") {

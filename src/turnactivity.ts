@@ -40,10 +40,37 @@ export interface TurnActivityState {
   ask?: string;
 }
 
-/** What a permission request asks, in a line: the tool and its description, as the push says it. */
+/**
+ * What a permission request would do, in its own terms and not the model's: the command, the file,
+ * the address. A Bash request's `description` is written by Claude, so a turn that has been led
+ * astray could call `curl … | sh` "Run the tests"; the answer on the Lock Screen has to be to the
+ * thing itself. Empty when the tool has nothing of the kind.
+ */
+export function askWhat(req: Line): string {
+  const input = (req.input ?? {}) as Line;
+  const text = (v: unknown): string => (typeof v === "string" ? v.replace(/\s+/g, " ").trim() : "");
+  if (req.tool_name === "Bash") return text(input.command);
+  const file = text(input.file_path ?? input.notebook_path ?? input.path);
+  if (file) return file.split("/").filter(Boolean).slice(-2).join("/");
+  return text(input.url) || text(input.query) || text(input.pattern);
+}
+
+function clip(line: string, max: number): string {
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
+/** A permission request in a line, for the Live Activity: the tool and what it would do. */
 export function askLine(req: Line): string {
-  const line = [req.display_name ?? req.tool_name, req.description].filter((p) => typeof p === "string" && p !== "").join(" · ");
-  return line.length > 80 ? `${line.slice(0, 79)}…` : line;
+  const what = askWhat(req) || (typeof req.description === "string" ? req.description : "");
+  return clip([req.display_name ?? req.tool_name, what].filter((p) => typeof p === "string" && p !== "").join(" · "), 80);
+}
+
+/** The same for a notification, which has room: what it would do, then Claude's own note on why. */
+export function askBody(req: Line): string {
+  const what = askWhat(req);
+  const note = typeof req.description === "string" ? req.description.trim() : "";
+  const head = clip([req.display_name ?? req.tool_name, what || note].filter((p) => typeof p === "string" && p !== "").join(" · "), 180);
+  return what && note && note !== what ? `${head}\n${clip(note, 120)}` : head;
 }
 
 /** The five-hour window off a rate_limit_event, as the app reads it (StreamReducer's fiveHourUtilization). */

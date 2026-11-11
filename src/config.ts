@@ -32,7 +32,7 @@ function num(name: string, fallback: number): number {
   const v = Number(process.env[name]);
   return Number.isFinite(v) && process.env[name] !== undefined ? v : fallback;
 }
-function expandHome(p: string): string {
+export function expandHome(p: string): string {
   return p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
 }
 

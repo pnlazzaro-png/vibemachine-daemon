@@ -13,9 +13,9 @@ import type { EventRow, SessionRow, SessionStatus, Store } from "./db.js";
 import { commitsSince, gitHead, type PipelineLine } from "./pipeline.js";
 import type { ActivityEvent, Notification } from "./notifier.js";
 import { isImagePath, PreviewWatcher, type XcodebuildOutcome } from "./preview.js";
-import { previewSummary } from "./project.js";
+import { previewSummary, projectConfig } from "./project.js";
 import { clock, fastestShipBefore } from "./stats.js";
-import { sessionMeter, sessionNow, stageForPipeline, TurnActivityPacer, TurnTracker, type SessionNow, type StageName } from "./turnactivity.js";
+import { askBody, sessionMeter, sessionNow, stageForPipeline, TurnActivityPacer, TurnTracker, type SessionNow, type StageName } from "./turnactivity.js";
 import { stopUploads } from "./uploads.js";
 import * as simLease from "./simlease.js";
 import { KeepAwake } from "./keepawake.js";
@@ -34,10 +34,18 @@ export interface SessionManagerEvents {
   meter: [NonNullable<ReturnType<typeof sessionMeter>>];
 }
 
+/** How much of a child's last words is kept for the phone: lines, and characters of them. */
+const STDERR_KEPT = 5;
+const STDERR_CHARS = 600;
+
 interface Live {
   proc: ClaudeSession;
+  /** The child's newest stderr lines: why it died, if it does. */
+  stderrTail: string[];
   turnStartHead: string | null;
   seenCommits: Set<string>;
+  /** The last look for new commits, so the next waits for it. */
+  commitWatch: Promise<void>;
   idleTimer: NodeJS.Timeout | null;
   /** A prompt sent while the process was starting, if any. */
   inTurn: boolean;
@@ -72,7 +80,14 @@ interface Live {
 }
 
 /** A session row as the phone sees it: with what the project's preview offers, and the stage it is on. */
-export type SessionInfo = SessionRow & { preview: ReturnType<typeof previewSummary>; now: SessionNow | null };
+export type SessionInfo = SessionRow & {
+  preview: ReturnType<typeof previewSummary>;
+  now: SessionNow | null;
+  /** Its newest picture, for the session list's row (2026-11-10); null with nothing shot. */
+  thumb: { id: string; width: number; height: number } | null;
+  /** Its last turns, oldest first: how long each took and whether it ended well. */
+  trail: { ms: number; ok: boolean }[];
+};
 
 export interface NewSessionInput {
   cwd: string;
@@ -206,10 +221,14 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       // Sent while a turn runs: the CLI holds it and echoes it only when its turn comes, so the
       // phone hears now that it is queued and can show it waiting.
       this.append(id, { type: "host", subtype: "queued", text, attachments: saved.map((s) => publicAttachment(s.row)), ts: new Date().toISOString() });
-      // A TestFlight upload under way stops: the queued change ships with this one, in one build.
-      void stopUploads(live.proc.pid)
-        .then((n) => { if (n > 0) console.log(`[${id.slice(0, 8)}] a prompt was queued: stopped the TestFlight upload (${n} processes)`); })
-        .catch((err: unknown) => console.error(`[${id.slice(0, 8)}] stopping the upload failed:`, err));
+      // A TestFlight upload under way stops, where the project asks for that (`.vibemachine.json`,
+      // `"release": { "stop_on_prompt": true }`): the queued change ships with this one, in one build.
+      // Only there: anyone's repo may have a `testflight.sh` of its own, with no trap to tidy up.
+      if (projectConfig(row.cwd).stopUploadsOnPrompt) {
+        void stopUploads(live.proc.pid)
+          .then((n) => { if (n > 0) console.log(`[${id.slice(0, 8)}] a prompt was queued: stopped the TestFlight upload (${n} processes)`); })
+          .catch((err: unknown) => console.error(`[${id.slice(0, 8)}] stopping the upload failed:`, err));
+      }
     }
     live.echo = saved.length > 0 ? { text, attachments: saved.map((s) => publicAttachment(s.row)) } : null;
     // Sent mid-turn, the prompt joins the running turn: its commits so far still count.
@@ -507,6 +526,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       proc,
       turnStartHead: null,
       seenCommits: new Set(),
+      commitWatch: Promise.resolve(),
       idleTimer: null,
       inTurn: false,
       turn: row.turns,
@@ -524,43 +544,68 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       interruptWatchdog: null,
       interruptUnanswered: false,
       retiring: null,
+      stderrTail: [],
     };
     // An upload the tool backgrounded ends after its tool call: the watcher says how.
     live.preview.onOutcome = (outcome) => this.buildOutcome(row.id, live, outcome);
     this.live.set(row.id, live);
 
-    proc.on("line", (line) => void this.onLine(row.id, live, line));
-    proc.on("permission", (req) => {
+    // A handler that throws (a write the database refused, say) is this session's trouble alone:
+    // said in the log, never left to reach the process and stop every other session's turn.
+    const guarded = (what: string, body: () => void): void => {
+      try {
+        body();
+      } catch (err) {
+        console.error(`[${row.id.slice(0, 8)}] ${what} failed:`, err);
+      }
+    };
+    proc.on("line", (line) => void this.onLine(row.id, live, line).catch((err: unknown) => console.error(`[${row.id.slice(0, 8)}] a line failed:`, err)));
+    proc.on("permission", (req) => guarded("a permission prompt", () => {
       this.setStatus(row.id, "waiting");
       const current = this.store.getSession(row.id);
       this.emit("notify", {
         sessionId: row.id,
+        kind: "permission",
         title: `${projectName(row.cwd)} needs your OK`,
-        body: [req.display_name ?? req.tool_name, req.description].filter(Boolean).join(" · ") || (current?.title ?? "a tool"),
+        body: askBody(req as unknown as Record<string, unknown>) || (current?.title ?? "a tool"),
         requestId: req.request_id,
       });
-    });
+    }));
     proc.on("stderr", (text) => {
       const trimmed = text.trim();
-      if (trimmed) console.error(`[${row.id.slice(0, 8)}] ${trimmed}`);
+      if (!trimmed) return;
+      console.error(`[${row.id.slice(0, 8)}] ${trimmed}`);
+      // The last few lines are kept: if the child dies, they are why, and the phone should say so.
+      live.stderrTail = [...live.stderrTail, ...trimmed.split("\n").map((l) => l.trim()).filter(Boolean)].slice(-STDERR_KEPT);
     });
-    proc.on("exit", ({ code, signal }) => {
-      if (this.live.get(row.id) === live) this.live.delete(row.id);
+    proc.on("exit", ({ code, signal }) => guarded("the exit", () => {
       this.clearIdle(live);
-      this.append(row.id, { type: "host", subtype: "exit", code, signal, ts: new Date().toISOString() });
+      const why = code !== 0 && live.stderrTail.length > 0 ? live.stderrTail.join("\n").slice(-STDERR_CHARS) : null;
+      this.append(row.id, { type: "host", subtype: "exit", code, signal, ...(why ? { stderr: why } : {}), ts: new Date().toISOString() });
       if (live.interruptWatchdog) clearTimeout(live.interruptWatchdog);
       const midTurn = live.inTurn;
       // Whatever it was doing, a child that's gone holds the Mac awake no longer.
       this.setInTurn(live, false);
       const current = this.store.getSession(row.id);
-      if (!current) return;
-      if (midTurn) {
+      if (current && midTurn) {
         // The child died mid-turn (or was stopped while waiting on a prompt): nothing will answer now.
+        // While the session is still among the live ones, so the turn's Live Activity hears it end
+        // and leaves the Lock Screen instead of showing a turn at work for ever.
         this.closeOnStream(row.id, `exited${code !== null ? ` ${code}` : ""}`);
+        if (code !== 0) {
+          this.emit("notify", {
+            sessionId: row.id,
+            kind: "stopped",
+            title: `${projectName(row.cwd)}: Claude Code stopped`,
+            body: why?.split("\n").at(-1) ?? `It exited${code !== null ? ` with status ${code}` : ""} in the middle of a turn.`,
+          });
+        }
       }
+      if (this.live.get(row.id) === live) this.live.delete(row.id);
+      if (!current) return;
       if (midTurn && code !== 0) this.setStatus(row.id, "failed");
       else if (current.status !== "ended") this.setStatus(row.id, "idle");
-    });
+    }));
     proc.start();
     return live;
   }
@@ -584,7 +629,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         ? "Claude Code refused the API key in the daemon's .env. Check ANTHROPIC_API_KEY on the Mac (or remove it to use your sign-in), then send the prompt again."
         : "Claude Code isn't signed in on this Mac. On the Mac, run claude in a terminal and sign in with your own account, then send the prompt again. vibemachine doctor checks it.";
       this.append(id, { type: "host", subtype: "notice", text, ts: new Date().toISOString() });
-      this.emit("notify", { sessionId: id, title: `${projectName(live.proc.cwd)}: Claude Code isn't signed in`, body: viaKey ? "The API key in .env was refused" : "Run claude on the Mac and sign in" });
+      this.emit("notify", { sessionId: id, kind: "stopped", title: `${projectName(live.proc.cwd)}: Claude Code isn't signed in`, body: viaKey ? "The API key in .env was refused" : "Run claude on the Mac and sign in" });
     }
     if (line.type === "assistant") {
       for (const block of contentBlocks(line)) {
@@ -654,27 +699,29 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       } else {
         this.armIdle(id, live);
       }
-      const interrupted = line.terminal_reason === "aborted_streaming";
-      const ok = line.subtype === "success";
-      this.emit("notify", {
-        sessionId: id,
-        title: `${projectName(live.proc.cwd)}: ${interrupted ? "interrupted" : ok ? "done" : "failed"}`,
-        body: caption ?? (row?.title ?? ""),
-      });
+      const note = turnEndPush(projectName(live.proc.cwd), line, caption ?? (row?.title ?? ""));
+      if (note) this.emit("notify", { sessionId: id, ...note });
     }
   }
 
-  private async recordCommits(id: string, live: Live): Promise<void> {
-    try {
-      for (const commit of await commitsSince(live.proc.cwd, live.turnStartHead)) {
-        if (commit.ref && live.seenCommits.has(commit.ref)) continue;
-        if (commit.ref) live.seenCommits.add(commit.ref);
-        // The turn it belongs to, so the phone shows its diff among that turn's pages.
-        this.append(id, { ...commit, turn: live.turn });
+  /**
+   * The turn's commits not yet on the stream. One round at a time for a session: lines arrive
+   * without waiting for each other, and two rounds reading git together would each post the same
+   * commits.
+   */
+  private recordCommits(id: string, live: Live): Promise<void> {
+    const round = live.commitWatch.then(async () => {
+      try {
+        const found = await commitsSince(live.proc.cwd, live.turnStartHead, live.seenCommits);
+        for (const sha of found.shas) live.seenCommits.add(sha);
+        // The turn they belong to, so the phone shows each diff among that turn's pages.
+        for (const line of found.lines) this.append(id, { ...line, turn: live.turn });
+      } catch (err) {
+        console.error(`[${id.slice(0, 8)}] commit watch failed:`, err);
       }
-    } catch (err) {
-      console.error(`[${id.slice(0, 8)}] commit watch failed:`, err);
-    }
+    });
+    live.commitWatch = round;
+    return round;
   }
 
   /** End the child on purpose and wait for it to go; the next prompt resumes the conversation. */
@@ -722,9 +769,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (record && live.activity && !live.activity.tracker.finished) {
       // The upload broke the record: the turn's card says so, with a sound.
       live.activity.tracker.setRecord(`fastest ship · ${record.time}${record.previous ? ` · was ${record.previous}` : ""}`);
-      this.emit("activity", { sessionId: id, event: "update", state: { ...live.activity.tracker.state }, alert: { title: "NEW RECORD", body: `${project} shipped in ${record.time}` } });
+      this.emit("activity", { sessionId: id, event: "update", state: { ...live.activity.tracker.state }, alert: { title: "NEW RECORD", body: `${project} shipped in ${record.time}` }, alertKind: "shipped" });
     }
-    if (!outcome.ok) this.emit("notify", { sessionId: id, title: `${project}: ${outcome.stage} failed`, body: outcome.detail || "see the log in the stream" });
+    const note = buildPush(project, outcome);
+    if (note) this.emit("notify", { sessionId: id, ...note });
   }
 
   private shipRecord(live: Live): { time: string; ms: number; previous: string | null } | null {
@@ -767,7 +815,17 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   private decorate(row: SessionRow): SessionInfo {
-    return { ...row, preview: previewSummary(row.cwd), now: this.now(row.id) };
+    return { ...row, preview: previewSummary(row.cwd), now: this.now(row.id), thumb: this.store.sessionThumb(row.id), trail: this.trail(row) };
+  }
+
+  /** A session's turn trail, read again only when another turn has ended. */
+  private trails = new Map<string, { turns: number; trail: { ms: number; ok: boolean }[] }>();
+  private trail(row: SessionRow): { ms: number; ok: boolean }[] {
+    const kept = this.trails.get(row.id);
+    if (kept && kept.turns === row.turns) return kept.trail;
+    const trail = this.store.turnTrail(row.id);
+    this.trails.set(row.id, { turns: row.turns, trail });
+    return trail;
   }
 
   private setStatus(id: string, status: SessionStatus): void {
@@ -781,6 +839,30 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
 }
 
 /** The start alert's line: the prompt, on one line and short, or the session's title for an empty one. */
+/**
+ * The push a turn's result makes, if any. A turn the person stopped themselves (an interrupt while
+ * Claude wrote or while a tool ran) makes none. A result that is an error says the session stopped
+ * and why, in the CLI's own words when it has them: the usage limit comes as a "success" carrying
+ * is_error and the 429's message ("You've hit your 5-hour limit · resets 6pm"), and was pushed as
+ * "done" until 2026-11-11.
+ */
+export function turnEndPush(project: string, line: Line, caption: string): Omit<Notification, "sessionId"> | null {
+  if (line.terminal_reason === "aborted_streaming" || line.terminal_reason === "aborted_tools") return null;
+  const said = typeof line.result === "string" ? line.result.trim() : "";
+  if (line.is_error === true || line.subtype !== "success") {
+    const limit = line.api_error_status === 429 || /\b(usage|session|5-hour|weekly) limit\b|out of usage/i.test(said);
+    return { kind: "stopped", title: `${project}: ${limit ? "usage limit" : "stopped"}`, body: said.split("\n")[0] || caption || "The turn ended with an error." };
+  }
+  return { kind: "turn_done", title: `${project}: done`, body: caption };
+}
+
+/** The push a build or an upload ending makes, if any: an upload that landed, or a build that failed. */
+export function buildPush(project: string, outcome: XcodebuildOutcome): Omit<Notification, "sessionId"> | null {
+  if (outcome.ok) return outcome.shipped ? { kind: "shipped", title: `${project}: on TestFlight`, body: outcome.detail } : null;
+  if (outcome.deliberate) return null;
+  return { kind: "build_failed", title: `${project}: ${outcome.title ?? `${outcome.stage} failed`}`, body: outcome.detail || "see the log in the stream" };
+}
+
 export function activityAlertBody(prompt: string, title: string): string {
   const line = prompt.replace(/\s+/g, " ").trim() || title.trim() || "A new turn";
   return line.length > 120 ? `${line.slice(0, 119)}…` : line;
