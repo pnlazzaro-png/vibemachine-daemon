@@ -2,7 +2,7 @@
 import { config } from "./config.js";
 import { Store } from "./db.js";
 import { sweep } from "./housekeeping.js";
-import { pruneCaptures, pruneOriginals } from "./preview.js";
+import { pruneCaptures, pruneOriginals, pruneStrays } from "./preview.js";
 import { startServer } from "./server.js";
 import { SessionManager } from "./sessions.js";
 import { UsageLedger } from "./usage.js";
@@ -19,6 +19,8 @@ const prune = (): void => {
     const captures = pruneCaptures(store);
     const originals = pruneOriginals();
     if (captures + originals > 0) console.log(`captures: pruned ${captures} capture(s) and ${originals} original(s) past their keep`);
+    const strays = pruneStrays();
+    if (strays > 0) console.log(`captures: emptied ${strays} half-saved clip(s) from a recording that never stopped`);
   } catch (err) {
     console.error("captures: prune failed:", err);
   }

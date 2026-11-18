@@ -18,6 +18,22 @@ export type Line = Record<string, unknown> & { type: string };
 /** `--effort` levels the CLI takes. */
 export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
+/** The question tool, the one request a phone answers with a changed input (its answers). */
+export const QUESTION_TOOL = "AskUserQuestion";
+
+/**
+ * What an allowed request runs with. A question runs with its own input plus the phone's answers,
+ * nothing else of what the phone sent; any other tool runs exactly as Claude asked, whatever came
+ * with the allow (audit 11.2: a tool dressed as a question could otherwise be run with input the
+ * phone made up).
+ */
+export function inputToRun(req: Pick<PermissionRequest, "tool_name" | "input">, updated: unknown): unknown {
+  if (req.tool_name !== QUESTION_TOOL || !updated || typeof updated !== "object" || Array.isArray(updated)) return req.input;
+  const asked = req.input && typeof req.input === "object" && !Array.isArray(req.input) ? (req.input as Record<string, unknown>) : {};
+  const answers = (updated as Record<string, unknown>).answers;
+  return answers && typeof answers === "object" && !Array.isArray(answers) ? { ...asked, answers } : asked;
+}
+
 export interface PermissionRequest {
   request_id: string;
   tool_name: string;
@@ -146,7 +162,7 @@ export class ClaudeSession extends EventEmitter<ClaudeSessionEvents> {
       decision.behavior === "allow"
         ? {
             behavior: "allow",
-            updatedInput: decision.updatedInput ?? req.input,
+            updatedInput: inputToRun(req, decision.updatedInput),
             ...(decision.updatedPermissions ? { updatedPermissions: decision.updatedPermissions } : {}),
           }
         : { behavior: "deny", message: decision.message };

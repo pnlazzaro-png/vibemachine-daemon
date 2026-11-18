@@ -75,3 +75,17 @@ test("db: a session's thumb is its newest picture that isn't a before, and its t
   assert.deepEqual(s.turnTrail("a", 2), [{ ms: 300, ok: false }, { ms: 0, ok: true }]);
   s.close();
 });
+
+test("db: a session's context is its last own call to the model, against the window its last turn reported", () => {
+  const s = new Store(":memory:");
+  s.insertSession({ id: "a", title: "t", cwd: "/x", model: null, permission_mode: "default", status: "idle", created_at: new Date().toISOString() });
+  assert.equal(s.sessionContext("a"), null, "nothing before its first reply");
+  const usage = (input: number, read: number, out: number) => ({ input_tokens: input, cache_creation_input_tokens: 100, cache_read_input_tokens: read, output_tokens: out });
+  s.appendEvent("a", { type: "assistant", parent_tool_use_id: null, message: { id: "m1", usage: usage(10, 1000, 50) } });
+  assert.deepEqual(s.sessionContext("a"), { tokens: 1160, window: null }, "before a turn has ended there is no window yet");
+  s.appendEvent("a", { type: "assistant", parent_tool_use_id: null, message: { id: "m2", usage: usage(5, 40_000, 200) } });
+  // A subagent's calls fill its own window, not the session's.
+  s.appendEvent("a", { type: "assistant", parent_tool_use_id: "toolu_1", message: { id: "m3", usage: usage(5, 900_000, 9) } });
+  s.appendEvent("a", { type: "result", subtype: "success", modelUsage: { "claude-haiku": { contextWindow: 200_000 }, "claude-opus": { contextWindow: 1_000_000 } } });
+  assert.deepEqual(s.sessionContext("a"), { tokens: 40_305, window: 1_000_000 });
+});

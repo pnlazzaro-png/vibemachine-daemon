@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { config } from "../src/config.js";
-import { installKind, installPrefix, lanAddresses, nodeCheck, pairingTarget, prefersWifi, projectsFolder, renderPlist, serverAddress, waitForIdle, wifiCheck, type TailscaleInfo, type WifiProbe } from "../src/setup.js";
+import { installKind, installPrefix, lanAddresses, nodeCheck, otherInstall, pairingTarget, plistDaemonRoot, prefersWifi, projectsFolder, renderPlist, serverAddress, waitForIdle, wifiCheck, type TailscaleInfo, type WifiProbe } from "../src/setup.js";
 
 test("renderPlist: the agent runs the daemon through its launcher, no Node pinned, logging under the data dir", () => {
   const plist = renderPlist("com.vibemachine.daemon", "/Users/x/vibemachine/daemon", "/Users/x/Library/Application Support/VibeMachine/logs", "/Users/x");
@@ -18,6 +18,37 @@ test("renderPlist: the agent runs the daemon through its launcher, no Node pinne
   assert.match(plist, /<key>KeepAlive<\/key>\s*<true\/>/);
   // A path with an ampersand can't break the XML.
   assert.match(renderPlist("l", "/Users/a&b/d", "/l", "/h"), /a&amp;b/);
+});
+
+test("plistDaemonRoot: the folder an agent runs the daemon from, its own or an older hand-written one", () => {
+  assert.equal(plistDaemonRoot(renderPlist("l", "/Users/a&b/daemon", "/l", "/h")), "/Users/a&b/daemon");
+  // The clone's agent before setup wrote them (node --import tsx src/main.ts).
+  const old = `<dict>\n\t<key>WorkingDirectory</key>\n\t<string>/Users/x/dev/vibemachine/daemon</string>\n</dict>`;
+  assert.equal(plistDaemonRoot(old), "/Users/x/dev/vibemachine/daemon");
+  assert.equal(plistDaemonRoot("<dict></dict>"), null);
+});
+
+test("otherInstall: setup leaves an agent that runs another copy alone, unless that copy is gone", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "vm-other-"));
+  try {
+    const clone = path.join(tmp, "dev", "vibemachine", "daemon");
+    const pkg = path.join(tmp, "lib", "node_modules", "vibemachine-daemon");
+    fs.mkdirSync(clone, { recursive: true });
+    fs.mkdirSync(pkg, { recursive: true });
+    // The npm copy's setup on a Mac whose agent runs the clone: another install.
+    assert.equal(otherInstall(renderPlist("l", clone, "/l", "/h"), pkg), clone);
+    // Its own agent (setup again, after an update): carry on.
+    assert.equal(otherInstall(renderPlist("l", pkg, "/l", "/h"), pkg), null);
+    // Through a symlink it is still its own.
+    const link = path.join(tmp, "link");
+    fs.symlinkSync(pkg, link);
+    assert.equal(otherInstall(renderPlist("l", link, "/l", "/h"), pkg), null);
+    // No agent yet, or one whose copy was deleted: nothing to protect.
+    assert.equal(otherInstall(null, pkg), null);
+    assert.equal(otherInstall(renderPlist("l", path.join(tmp, "gone"), "/l", "/h"), pkg), null);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test("nodeCheck: 24 and up", () => {

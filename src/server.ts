@@ -8,7 +8,7 @@
 //   POST /sessions                         {cwd, prompt, title?, model?, effort?, permission_mode?, attachments?}
 //   POST /sessions/:id/prompt              {prompt, attachments?: [{name, media_type, data (base64)}]}
 //   POST /sessions/:id/settings            {model?, effort?, permission_mode?} (null resets model/effort) → {session}
-//   POST /sessions/:id/permission          {request_id, behavior, message?, updated_permissions?}
+//   POST /sessions/:id/permission          {request_id, behavior, message?, updated_permissions?, updated_input?}
 //   POST /sessions/:id/interrupt
 //   POST /sessions/:id/stop
 //   POST /sessions/:id/archive             {archived?: boolean (default true)} out of the list, or back → {session}
@@ -60,7 +60,8 @@ import type { UsageLedger } from "./usage.js";
 const VERSION = packageVersion;
 /** The protocol the app and the daemon speak. Bump it when a change would break the other side;
  *  MIN_APP_API is the oldest app this daemon still serves (the app checks both, Core/Compatibility.swift). */
-export const API = 1;
+/** 2 (2026-11-13): a permission's allow may carry `updated_input` (an `AskUserQuestion`'s answers). */
+export const API = 2;
 export const MIN_APP_API = 1;
 /** The `/sessions/:id/<action>` routes; any other action is a route this daemon doesn't know. */
 const SESSION_ACTIONS = new Set(["events", "prompt", "settings", "permission", "interrupt", "stop", "preview", "pipeline", "archive"]);
@@ -461,7 +462,10 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
         let ok: boolean;
         if (behavior === "allow") {
           const updated = Array.isArray(json.updated_permissions) ? json.updated_permissions : undefined;
-          ok = sessions.answer(id, requestId, { behavior: "allow", ...(updated ? { updatedPermissions: updated } : {}) });
+          // A changed input to run with: an `AskUserQuestion`'s questions with the user's answers (api 2).
+          const input = json.updated_input;
+          const updatedInput = input && typeof input === "object" && !Array.isArray(input) ? input : undefined;
+          ok = sessions.answer(id, requestId, { behavior: "allow", ...(updated ? { updatedPermissions: updated } : {}), ...(updatedInput ? { updatedInput } : {}) });
         } else if (behavior === "deny") {
           ok = sessions.answer(id, requestId, { behavior: "deny", message: optionalString(json, "message") ?? "Declined on the phone." });
         } else throw new HttpError(400, "behavior must be allow or deny");

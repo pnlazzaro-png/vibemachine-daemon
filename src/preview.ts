@@ -110,6 +110,9 @@ export const SERVED_JPEG_QUALITY = 75;
  *  and any left over go after this long. */
 export const ORIGINAL_KEEP_MS = 3 * 24 * 60 * 60 * 1000;
 
+/** A clip still half-saved after this long is a recording that never stopped (a clip lasts seconds). */
+export const STRAY_KEEP_MS = 60 * 60 * 1000;
+
 /** Where a capture's full-resolution original lived, beside the shrunk copy. */
 export function originalPath(file: string): string {
   return file.replace(/\.png$/, "-full.png");
@@ -230,6 +233,33 @@ function keptForGood(store: Store): Set<string> {
 }
 
 /** Deletes leftover originals older than `ORIGINAL_KEEP_MS` (the shrunk copies stay); returns how many went. */
+/**
+ * Half-saved clips (`clip-….mov.sb-…`, the name a file has while it is written) left by a recording
+ * that never stopped: when `stop` gives up and kills simctl, the simulator's render server can go on
+ * writing for days (one reached 27 GB, 2026-11-12, and filled the disk). Past an hour one is emptied,
+ * which frees its room even while something holds it open, and deleted once nothing writes to it
+ * (deleted while written, it would go on growing out of reach).
+ */
+export function pruneStrays(dir: string = capturesDir, now: number = Date.now()): number {
+  let removed = 0;
+  if (!fs.existsSync(dir)) return 0;
+  for (const session of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!session.isDirectory()) continue;
+    const folder = path.join(dir, session.name);
+    for (const name of fs.readdirSync(folder)) {
+      if (!/^clip-.*\.sb-/.test(name)) continue;
+      const file = path.join(folder, name);
+      const st = fs.statSync(file);
+      const started = Math.min(st.birthtimeMs || st.mtimeMs, st.mtimeMs);
+      if (now - started <= STRAY_KEEP_MS) continue;
+      if (st.size > 0) fs.truncateSync(file, 0);
+      if (now - st.mtimeMs > STRAY_KEEP_MS) fs.rmSync(file, { force: true });
+      removed++;
+    }
+  }
+  return removed;
+}
+
 export function pruneOriginals(dir: string = capturesDir, now: number = Date.now()): number {
   let removed = 0;
   if (!fs.existsSync(dir)) return 0;
@@ -621,7 +651,7 @@ export class PreviewWatcher {
     }
   }
 
-  /** Capture now, whatever happened (vm preview, or the phone): no "before" unless the turn already has one. */
+  /** Capture now, whatever happened (vm preview): no "before" unless the turn already has one. */
   captureNow(): Promise<void> {
     const p = this.preview;
     if (!p) throw new Error(`no iPhone app built in ${this.cwd} yet, and no .vibemachine.json naming one`);

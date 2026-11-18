@@ -408,6 +408,34 @@ export class Store {
     return rows.reverse().map((r) => ({ ms: Math.max(0, Math.round(r.ms ?? 0)), ok: r.subtype === "success" }));
   }
 
+  /**
+   * How full a session's context window stood when its last turn ended: the tokens its last call to
+   * the model sent and got back (the session's own calls, not a subagent's), and the window of the
+   * model that ran, as the turn's result reported it. As the phone's stream reckons it
+   * (StreamReducer's `contextUsed`). Null before its first reply.
+   */
+  sessionContext(sessionId: string): { tokens: number; window: number | null } | null {
+    const usage = this.db
+      .prepare(
+        `SELECT json_extract(json, '$.message.usage') AS usage FROM events
+         WHERE session_id = ? AND type = 'assistant' AND json_extract(json, '$.parent_tool_use_id') IS NULL
+           AND json_extract(json, '$.message.usage') IS NOT NULL
+         ORDER BY seq DESC LIMIT 1`,
+      )
+      .get(sessionId) as { usage: string } | undefined;
+    if (!usage) return null;
+    const tokens = contextTokens(JSON.parse(usage.usage) as Record<string, unknown>);
+    if (tokens <= 0) return null;
+    const result = this.db
+      .prepare(
+        `SELECT json_extract(json, '$.modelUsage') AS models FROM events
+         WHERE session_id = ? AND type = 'result' AND json_extract(json, '$.modelUsage') IS NOT NULL
+         ORDER BY seq DESC LIMIT 1`,
+      )
+      .get(sessionId) as { models: string } | undefined;
+    return { tokens, window: result ? contextWindow(JSON.parse(result.models) as Record<string, unknown>) : null };
+  }
+
   deleteCapture(id: string): void {
     this.db.prepare(`DELETE FROM captures WHERE id = ?`).run(id);
   }
@@ -580,4 +608,18 @@ export class Store {
   close(): void {
     this.db.close();
   }
+}
+
+/** What a call to the model held of the context: what it sent (fresh, cached and read from the cache) and what came back. */
+export function contextTokens(usage: Record<string, unknown>): number {
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  return n(usage.input_tokens) + n(usage.cache_creation_input_tokens) + n(usage.cache_read_input_tokens) + n(usage.output_tokens);
+}
+
+/** The context window a turn's result reports: the largest of its models', if it ran several. */
+export function contextWindow(models: Record<string, unknown>): number | null {
+  const windows = Object.values(models)
+    .map((m) => (m && typeof m === "object" ? (m as { contextWindow?: unknown }).contextWindow : undefined))
+    .filter((w): w is number => typeof w === "number" && w > 0);
+  return windows.length > 0 ? Math.max(...windows) : null;
 }

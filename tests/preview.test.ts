@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { Store } from "../src/db.js";
-import { buildsPreviewApp, CAPTURE_KEEP_MS, foldedNote, isImagePath, isReleaseScript, launchedArgs, ORIGINAL_KEEP_MS, originalPath, PreviewWatcher, pruneCaptures, pruneOriginals, releaseOutcome, screensFor, xcodebuildOutcome } from "../src/preview.js";
+import { buildsPreviewApp, CAPTURE_KEEP_MS, foldedNote, isImagePath, isReleaseScript, launchedArgs, ORIGINAL_KEEP_MS, originalPath, PreviewWatcher, pruneCaptures, pruneOriginals, pruneStrays, releaseOutcome, STRAY_KEEP_MS, screensFor, xcodebuildOutcome } from "../src/preview.js";
 import { parseProjectConfig } from "../src/project.js";
 import { bmpHasPixels, displayKind, parseDisplays, pngSize } from "../src/simulator.js";
 
@@ -215,6 +215,31 @@ test("originals: kept beside the pane's copy, pruned once past their keep", () =
   write("new-full.png", 1000);
   assert.equal(pruneOriginals(dir, now), 1);
   assert.deepEqual(fs.readdirSync(session).sort(), ["new-full.png", "old.png"]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a half-saved clip from a recording that never stopped is emptied, and deleted once it isn't written", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vm-strays-"));
+  const session = path.join(dir, "session");
+  fs.mkdirSync(session);
+  const now = Date.now();
+  const old = new Date(now - STRAY_KEEP_MS * 3);
+  const file = (name: string) => path.join(session, name);
+  // Abandoned: written long ago, nothing writing now.
+  fs.writeFileSync(file("clip-a.mov.sb-1-x"), "frames");
+  fs.utimesSync(file("clip-a.mov.sb-1-x"), old, old);
+  // Stuck: begun long ago (moving its time back moves its birth back too), still being written.
+  fs.writeFileSync(file("clip-b.mov.sb-1-y"), "frames");
+  fs.utimesSync(file("clip-b.mov.sb-1-y"), old, old);
+  fs.appendFileSync(file("clip-b.mov.sb-1-y"), "more frames");
+  // A clip being recorded right now, and a finished capture, are left alone.
+  fs.writeFileSync(file("clip-c.mov.sb-1-z"), "frames");
+  fs.writeFileSync(file("old.png"), "png");
+  fs.utimesSync(file("old.png"), old, old);
+  assert.equal(pruneStrays(dir, now), 2);
+  assert.deepEqual(fs.readdirSync(session).sort(), ["clip-b.mov.sb-1-y", "clip-c.mov.sb-1-z", "old.png"]);
+  assert.equal(fs.statSync(file("clip-b.mov.sb-1-y")).size, 0, "the stuck one is emptied, kept reachable");
+  assert.equal(fs.statSync(file("clip-c.mov.sb-1-z")).size, 6);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

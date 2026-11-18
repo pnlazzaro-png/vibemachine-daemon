@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { config } from "../src/config.js";
 import { relaySend, type Transport } from "../src/push.js";
-import { callerKey, createRelay, parseRelayRequest, PAYLOAD_MAX, RateLimit } from "../src/pushrelay.js";
+import { callerKey, createRelay, networkKey, parseRelayRequest, PAYLOAD_MAX, RateLimit, Remembered } from "../src/pushrelay.js";
 
 const TOKEN = "ab".repeat(32);
 const PAYLOAD = JSON.stringify({ aps: { alert: { title: "t", body: "b" } } });
@@ -114,4 +114,45 @@ test("callerKey: an IPv6 caller is its /64, an IPv4 caller itself, mapped or not
   assert.equal(callerKey("::1"), "0:0:0:0::/64");
   assert.equal(callerKey("fe80::1%en0"), "fe80:0:0:0::/64");
   assert.equal(callerKey(""), "?");
+});
+
+test("networkKey: an IPv6 caller's /48, an IPv4 caller itself", () => {
+  assert.equal(networkKey("2001:db8:1:2::1"), "2001:db8:1::/48");
+  assert.equal(networkKey("2001:db8:1:ffff::1"), networkKey("2001:db8:1:2::9"));
+  assert.notEqual(networkKey("2001:db8:1::1"), networkKey("2001:db8:2::1"));
+  assert.equal(networkKey("203.0.113.7"), "203.0.113.7");
+});
+
+test("Remembered: kept for a while, the oldest dropped past its size", () => {
+  const r = new Remembered<number>(1000, 2);
+  r.set("a", 1, 0);
+  r.set("b", 2, 10);
+  r.set("c", 3, 20);
+  assert.equal(r.get("a", 30), undefined, "the oldest went");
+  assert.equal(r.get("b", 30), 2);
+  assert.equal(r.get("c", 1020), undefined, "past its keep");
+});
+
+test("relay: made-up tokens can't use up a real phone's pushes, and a refused token isn't sent again", { skip: !config.apns.keyId && "no APNS_KEY_ID in .env" }, async () => {
+  const sent: string[] = [];
+  const apple: Transport = async (req) => (sent.push(req.token), req.token === TOKEN ? { status: 200 } : { status: 400, reason: "BadDeviceToken" });
+  const server = createRelay({ transport: apple, overall: 2, perCaller: 100 });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const push = (token: string) => relaySend(base, { environment: "production", type: "alert", priority: "10", token, payload: PAYLOAD });
+  try {
+    assert.equal((await push(TOKEN)).status, 200, "the real phone's first push, while the relay is quiet");
+    // A flood of made-up tokens: the first are tried once, then the shared budget is spent.
+    const junk = ["a1", "b2", "c3"].map((x) => x.repeat(32));
+    for (const t of junk) await push(t);
+    assert.match((await push("d4".repeat(32))).reason ?? "", /relay 429/);
+    // The phone Apple took before still gets through.
+    assert.equal((await push(TOKEN)).status, 200);
+    // A token Apple refused is answered from memory, not sent again.
+    const before = sent.length;
+    assert.deepEqual(await push(junk[0]!), { status: 400, reason: "BadDeviceToken" });
+    assert.equal(sent.length, before);
+  } finally {
+    server.close();
+  }
 });

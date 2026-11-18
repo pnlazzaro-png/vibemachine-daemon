@@ -55,22 +55,67 @@ export function askWhat(req: Line): string {
   return text(input.url) || text(input.query) || text(input.pattern);
 }
 
+/**
+ * A push's text with what looks like a secret taken out. A permission push shows the command itself
+ * (above), and it travels through the relay and Apple and stands on the Lock Screen, where a Live
+ * Activity shows whatever the phone's preview setting: so a header's token, a URL's password, a
+ * `…_KEY=` value, a `--token` flag and anything shaped like a known key become "•••" (audit 11.4,
+ * 2026-11-14). The phone's own stream, over the signed connection, keeps the command whole.
+ */
+export function redactSecrets(text: string): string {
+  const hidden = "•••";
+  return text
+    // Authorization: Bearer abc / Basic abc / token abc, quoted or not.
+    .replace(/(authorization\s*[:=]\s*)(?:(bearer|basic|token)\s+)?[^\s"']+/gi, (_m, head: string, kind?: string) => `${head}${kind ? `${kind} ` : ""}${hidden}`)
+    // Other credential headers: X-Api-Key: abc, Api-Key: abc, Cookie: abc.
+    .replace(/((?:x-)?(?:api[-_]?key|auth[-_]?token|access[-_]?token|cookie)\s*:\s*)[^\s"']+/gi, `$1${hidden}`)
+    // scheme://user:password@host
+    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+@/gi, `$1${hidden}@`)
+    // NAME=value where the name says what it is (export AWS_SECRET_ACCESS_KEY=…, PGPASSWORD=…).
+    .replace(/\b([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PWD|AUTH|CREDENTIALS?)[A-Za-z0-9_]*\s*=\s*)("[^"]*"|'[^']*'|[^\s;&|]+)/gi, `$1${hidden}`)
+    // --password x, --token=x, --api-key x, -p'x' is left: too many flags are called -p.
+    .replace(/((?<![\w-])--?(?:password|passwd|token|secret|api[-_]?key|access[-_]?key|auth)(?:=|\s+))("[^"]*"|'[^']*'|[^\s;&|-][^\s;&|]*)/gi, `$1${hidden}`)
+    // Shapes of known keys: GitHub, OpenAI and Anthropic, Slack, AWS, Google, JWTs.
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(?:ant-)?[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g, hidden)
+    // A long unbroken run of key-like characters (32 or more, with letters and digits both) that isn't a
+    // path, nor a git commit's 40 lowercase hex (commands name commits all the time).
+    .replace(/(?<![\w/.-])(?=[A-Za-z0-9_\-+=]*\d)(?=[A-Za-z0-9_\-+=]*[A-Za-z])[A-Za-z0-9_\-+=]{32,}(?![\w/.-])/g, (run) => (/^[0-9a-f]{40}$/.test(run) ? run : hidden));
+}
+
 function clip(line: string, max: number): string {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
+/**
+ * Claude asking the user something (`AskUserQuestion`), not for leave to act: the first question's
+ * words, or null for any other request. It comes as a permission request, but it is answered in
+ * the app, with the user's choices; Allow on the Lock Screen would send it back with none, so a
+ * question has no Allow or Deny there.
+ */
+export function askQuestion(req: Line): string | null {
+  if (req.tool_name !== "AskUserQuestion") return null;
+  const questions = ((req.input ?? {}) as Line).questions;
+  const first = Array.isArray(questions) ? (questions[0] as Line | undefined) : undefined;
+  const text = typeof first?.question === "string" ? first.question.replace(/\s+/g, " ").trim() : "";
+  return text || "Claude has a question";
+}
+
 /** A permission request in a line, for the Live Activity: the tool and what it would do. */
 export function askLine(req: Line): string {
+  const question = askQuestion(req);
+  if (question) return clip(`Question · ${question}`, 80);
   const what = askWhat(req) || (typeof req.description === "string" ? req.description : "");
-  return clip([req.display_name ?? req.tool_name, what].filter((p) => typeof p === "string" && p !== "").join(" · "), 80);
+  return clip(redactSecrets([req.display_name ?? req.tool_name, what].filter((p) => typeof p === "string" && p !== "").join(" · ")), 80);
 }
 
 /** The same for a notification, which has room: what it would do, then Claude's own note on why. */
 export function askBody(req: Line): string {
+  const question = askQuestion(req);
+  if (question) return clip(question, 180);
   const what = askWhat(req);
   const note = typeof req.description === "string" ? req.description.trim() : "";
-  const head = clip([req.display_name ?? req.tool_name, what || note].filter((p) => typeof p === "string" && p !== "").join(" · "), 180);
-  return what && note && note !== what ? `${head}\n${clip(note, 120)}` : head;
+  const head = clip(redactSecrets([req.display_name ?? req.tool_name, what || note].filter((p) => typeof p === "string" && p !== "").join(" · ")), 180);
+  return what && note && note !== what ? `${head}\n${clip(redactSecrets(note), 120)}` : head;
 }
 
 /** The five-hour window off a rate_limit_event, as the app reads it (StreamReducer's fiveHourUtilization). */
@@ -163,7 +208,7 @@ export class TurnTracker {
   private readonly touched = new Set<StageName>(["prompt"]);
   private readonly failed = new Set<StageName>();
   /** Permission requests waiting on the user: the stage each is about, and what it asks. */
-  private readonly waiting = new Map<string, { stage: StageName; ask: string }>();
+  private readonly waiting = new Map<string, { stage: StageName; ask: string; question: boolean }>();
   /** Each model call's usage, by message id: partial messages repeat a message, so it is kept, not summed. */
   private readonly calls = new Map<string, Usage>();
   private currentMessage: string | null = null;
@@ -196,7 +241,7 @@ export class TurnTracker {
         const req = line.request as Line | undefined;
         if (req?.subtype === "can_use_tool" && typeof line.request_id === "string") {
           const stage = stageForTool(String(req.tool_name ?? ""), req.input);
-          this.waiting.set(line.request_id, { stage, ask: askLine(req) });
+          this.waiting.set(line.request_id, { stage, ask: askLine(req), question: askQuestion(req) !== null });
           this.touch(stage);
         }
         break;
@@ -305,7 +350,7 @@ export class TurnTracker {
     const usage = this.final && this.final.input + this.final.output >= sum.input + sum.output ? this.final : sum;
     let stage = this.hot;
     let status = this.status;
-    let asking: { requestId: string; ask: string } | null = null;
+    let asking: { requestId?: string; ask: string } | null = null;
     if (!this.finished) {
       // What matters most right now: a failure, then a wait on the user, then what is running.
       const failed = STAGES.find((s) => this.failed.has(s));
@@ -316,7 +361,8 @@ export class TurnTracker {
       } else if (waiting) {
         stage = waiting[1].stage;
         status = "waiting";
-        asking = { requestId: waiting[0], ask: waiting[1].ask };
+        // A question is answered in the app: no request, so no Allow or Deny on the Lock Screen.
+        asking = waiting[1].question ? { ask: waiting[1].ask } : { requestId: waiting[0], ask: waiting[1].ask };
       }
     }
     return {

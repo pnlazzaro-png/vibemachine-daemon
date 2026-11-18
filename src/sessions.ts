@@ -15,7 +15,7 @@ import type { ActivityEvent, Notification } from "./notifier.js";
 import { isImagePath, PreviewWatcher, type XcodebuildOutcome } from "./preview.js";
 import { previewSummary, projectConfig } from "./project.js";
 import { clock, fastestShipBefore } from "./stats.js";
-import { askBody, sessionMeter, sessionNow, stageForPipeline, TurnActivityPacer, TurnTracker, type SessionNow, type StageName } from "./turnactivity.js";
+import { askBody, askQuestion, redactSecrets, sessionMeter, sessionNow, stageForPipeline, TurnActivityPacer, TurnTracker, type SessionNow, type StageName } from "./turnactivity.js";
 import { stopUploads } from "./uploads.js";
 import * as simLease from "./simlease.js";
 import { KeepAwake } from "./keepawake.js";
@@ -87,6 +87,9 @@ export type SessionInfo = SessionRow & {
   thumb: { id: string; width: number; height: number } | null;
   /** Its last turns, oldest first: how long each took and whether it ended well. */
   trail: { ms: number; ok: boolean }[];
+  /** How full its context window stood when its last turn ended (2026-11-11): tokens, and the window; null before its first reply. */
+  context_tokens: number | null;
+  context_window: number | null;
 };
 
 export interface NewSessionInput {
@@ -111,6 +114,12 @@ export interface SessionOptions {
 }
 
 /** A request the daemon won't act on as asked: the caller's to fix (a 400). */
+
+/** The answers in an `AskUserQuestion` reply (question text to the choice, or choices), if any. */
+function answersOf(updatedInput: unknown): Record<string, unknown> | undefined {
+  const answers = (updatedInput as { answers?: unknown } | undefined)?.answers;
+  return answers && typeof answers === "object" && !Array.isArray(answers) ? (answers as Record<string, unknown>) : undefined;
+}
 export class BadRequestError extends Error {}
 
 export class SessionManager extends EventEmitter<SessionManagerEvents> {
@@ -355,7 +364,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return this.get(id)!;
   }
 
-  /** Screenshot the project's app in the simulator now (vm preview, or the phone). */
+  /** Screenshot the project's app in the simulator now (vm preview; the phone's key for it went 2026-11-12). */
   async capturePreview(id: string): Promise<void> {
     const row = this.store.getSession(id);
     if (!row) throw new Error("no such session");
@@ -381,6 +390,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         request_id: requestId,
         behavior: decision.behavior,
         ...(decision.behavior === "deny" ? { message: decision.message } : {}),
+        // A question's answers, for the card to say what was chosen.
+        ...(decision.behavior === "allow" && answersOf(decision.updatedInput) ? { answers: answersOf(decision.updatedInput) } : {}),
         ts: new Date().toISOString(),
       });
       if (live.proc.pending.size === 0) this.setStatus(id, "running");
@@ -563,12 +574,14 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     proc.on("permission", (req) => guarded("a permission prompt", () => {
       this.setStatus(row.id, "waiting");
       const current = this.store.getSession(row.id);
+      // A question is answered in the app: no request on the push, so it has no Allow or Deny.
+      const question = askQuestion(req as unknown as Record<string, unknown>) !== null;
       this.emit("notify", {
         sessionId: row.id,
         kind: "permission",
-        title: `${projectName(row.cwd)} needs your OK`,
+        title: question ? `${projectName(row.cwd)} has a question` : `${projectName(row.cwd)} needs your OK`,
         body: askBody(req as unknown as Record<string, unknown>) || (current?.title ?? "a tool"),
-        requestId: req.request_id,
+        ...(question ? {} : { requestId: req.request_id }),
       });
     }));
     proc.on("stderr", (text) => {
@@ -597,7 +610,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
             sessionId: row.id,
             kind: "stopped",
             title: `${projectName(row.cwd)}: Claude Code stopped`,
-            body: why?.split("\n").at(-1) ?? `It exited${code !== null ? ` with status ${code}` : ""} in the middle of a turn.`,
+            body: why ? redactSecrets(why.split("\n").at(-1) ?? "") : `It exited${code !== null ? ` with status ${code}` : ""} in the middle of a turn.`,
           });
         }
       }
@@ -815,7 +828,21 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   private decorate(row: SessionRow): SessionInfo {
-    return { ...row, preview: previewSummary(row.cwd), now: this.now(row.id), thumb: this.store.sessionThumb(row.id), trail: this.trail(row) };
+    const context = this.context(row);
+    return {
+      ...row, preview: previewSummary(row.cwd), now: this.now(row.id), thumb: this.store.sessionThumb(row.id), trail: this.trail(row),
+      context_tokens: context?.tokens ?? null, context_window: context?.window ?? null,
+    };
+  }
+
+  /** A session's context, read again only when another turn has ended (as its trail). */
+  private contexts = new Map<string, { turns: number; context: { tokens: number; window: number | null } | null }>();
+  private context(row: SessionRow): { tokens: number; window: number | null } | null {
+    const kept = this.contexts.get(row.id);
+    if (kept && kept.turns === row.turns) return kept.context;
+    const context = this.store.sessionContext(row.id);
+    this.contexts.set(row.id, { turns: row.turns, context });
+    return context;
   }
 
   /** A session's turn trail, read again only when another turn has ended. */
@@ -851,7 +878,7 @@ export function turnEndPush(project: string, line: Line, caption: string): Omit<
   const said = typeof line.result === "string" ? line.result.trim() : "";
   if (line.is_error === true || line.subtype !== "success") {
     const limit = line.api_error_status === 429 || /\b(usage|session|5-hour|weekly) limit\b|out of usage/i.test(said);
-    return { kind: "stopped", title: `${project}: ${limit ? "usage limit" : "stopped"}`, body: said.split("\n")[0] || caption || "The turn ended with an error." };
+    return { kind: "stopped", title: `${project}: ${limit ? "usage limit" : "stopped"}`, body: redactSecrets(said.split("\n")[0] ?? "") || caption || "The turn ended with an error." };
   }
   return { kind: "turn_done", title: `${project}: done`, body: caption };
 }

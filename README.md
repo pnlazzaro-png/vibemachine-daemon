@@ -165,6 +165,11 @@ trust question once, and from then on a command they cover runs without
 asking the phone. (Checked with Claude Code 2.1.321.) Read those two files
 in a repo you didn't write before you start a session in it.
 
+The daemon itself trusts a repo in one more way: when a turn builds an
+iPhone app in it (one named in its `.vibemachine.json`, or an `.app` found
+under a `*-iphonesimulator` products folder), it installs that app in the
+Simulator and opens it to take the before-and-after screenshots.
+
 ## Support
 
 https://getvibemachine.com/support, or support@getvibemachine.com. Include

@@ -415,6 +415,59 @@ export interface SetupOptions {
   wifi?: boolean;
   /** `--projects <folder>`: where the repos live, kept as PROJECTS_DIR. */
   projects?: string;
+  /** `--replace`: take over a LaunchAgent that runs the daemon from another copy (a clone, another prefix). */
+  replace?: boolean;
+}
+
+/** The folder an installed LaunchAgent runs the daemon from (its WorkingDirectory), or null. */
+export function plistDaemonRoot(plist: string): string | null {
+  const m = plist.match(/<key>WorkingDirectory<\/key>\s*<string>([^<]*)<\/string>/);
+  return m?.[1] !== undefined ? m[1].replace(/&lt;/g, "<").replace(/&amp;/g, "&") : null;
+}
+
+/**
+ * Another copy of the daemon this Mac's LaunchAgent already runs, still on disk: `setup` from this
+ * copy would stop it, point the agent here and lay a fresh .env over the one it reads (Pete,
+ * 2026-11-18: the npm package's setup took over the clone's install). Null when the agent is this
+ * copy's, or there is none, or the copy it ran is gone.
+ */
+export function otherInstall(plist: string | null, root = daemonRoot): string | null {
+  if (!plist) return null;
+  const theirs = plistDaemonRoot(plist);
+  if (!theirs || !fs.existsSync(theirs)) return null;
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  return real(theirs) === real(root) ? null : theirs;
+}
+
+/** Whether launchd has the agent loaded at all. */
+function agentLoaded(uid: number, label: string): boolean {
+  return spawnSync("/bin/launchctl", ["print", `gui/${uid}/${label}`], { stdio: "ignore" }).status === 0;
+}
+
+/**
+ * (Re)load the agent from its plist. `bootout` returns before launchd has let go of the old one, and a
+ * `bootstrap` straight after fails with "5: Input/output error" (what left Pete's daemon down,
+ * 2026-11-18), so it waits for the old one to be gone, and tries the bootstrap a few times.
+ */
+export async function loadAgent(uid: number, label: string, plistPath: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  spawnSync("/bin/launchctl", ["bootout", `gui/${uid}/${label}`], { stdio: "ignore" });
+  for (let i = 0; i < 40 && agentLoaded(uid, label); i++) await sleep(250);
+  spawnSync("/bin/launchctl", ["enable", `gui/${uid}/${label}`], { stdio: "ignore" });
+  let error = "";
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) await sleep(1000);
+    const boot = spawnSync("/bin/launchctl", ["bootstrap", `gui/${uid}`, plistPath], { encoding: "utf8" });
+    if (boot.status === 0) return { ok: true };
+    error = (boot.stderr || boot.stdout).trim().split("\n")[0] ?? `exit ${boot.status}`;
+  }
+  return { ok: false, error };
 }
 
 /**
@@ -437,6 +490,18 @@ export async function projectsFolder(opts: { projects?: string; dryRun?: boolean
 /** Install the daemon on this Mac and print how to pair the phone. */
 export async function setup(store: Store, opts: SetupOptions): Promise<void> {
   const say = (s: string) => console.log(s);
+  const label = launchdLabel();
+  const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", `${label}.plist`);
+  const previousPlist = fs.existsSync(plistPath) ? fs.readFileSync(plistPath, "utf8") : null;
+  // Another copy already runs here: leave it be, before anything is copied or written, unless asked.
+  const other = otherInstall(previousPlist);
+  if (other && !opts.replace) {
+    throw new Error(
+      `Vibe Machine is already set up on this Mac, running from ${other}. Nothing was changed.\n` +
+        `  For a pairing code: ${path.join(other, "bin", "vibemachine")} pair\n` +
+        `  To run this copy (${daemonRoot}) instead: ${cliName} setup --replace`,
+    );
+  }
   // A clone keeps its .env beside package.json; an installed package keeps it in the data folder,
   // which `npm install -g` doesn't replace on an update.
   const envFile = configEnvFile;
@@ -488,7 +553,10 @@ export async function setup(store: Store, opts: SetupOptions): Promise<void> {
   // serving, or serving a tailnet with no iPhone on it.
   const lan = opts.lan ?? (config.lan || opts.wifi === true || !served.serving || served.iosPeers === 0);
   if (lan !== config.lan) {
-    say(`${opts.dryRun ? "would set" : "setting"} LAN=${lan ? 1 : 0} in .env (${lan ? "the phone reaches this Mac on the Wi-Fi" : "Wi-Fi listener off"})`);
+    // Turned on by itself, it says why and how to undo it: the listener answers on every network this
+    // Mac joins, a café's too (signed requests only, but more to reach), audit 11.12.
+    const why = opts.lan !== undefined || opts.wifi === true ? "" : !served.serving ? ", since Tailscale isn't serving" : served.iosPeers === 0 ? ", since no iPhone is on your tailnet yet" : "";
+    say(`${opts.dryRun ? "would set" : "setting"} LAN=${lan ? 1 : 0} in .env (${lan ? `the phone reaches this Mac on the Wi-Fi${why}; it listens on any network this Mac joins. Once the phone is on Tailscale, ${cliName} setup --no-lan turns it off` : "Wi-Fi listener off"})`);
     if (!opts.dryRun) {
       fs.writeFileSync(envFile, setEnvLine(fs.readFileSync(envFile, "utf8"), "LAN", lan ? "1" : "0"));
       // This run's closing checks should test the Wi-Fi side the daemon is about to serve.
@@ -497,9 +565,7 @@ export async function setup(store: Store, opts: SetupOptions): Promise<void> {
   }
   if (lan && !opts.dryRun) ensureTls();
 
-  const label = launchdLabel();
   const logDir = path.join(config.dataDir, "logs");
-  const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", `${label}.plist`);
   const plist = renderPlist(label, daemonRoot, logDir, os.homedir());
   say(`${opts.dryRun ? "would write" : "writing"} ${plistPath} (label ${label}, through ${path.join(daemonRoot, "bin", "vibemachine")})`);
   if (opts.dryRun) say(plist);
@@ -509,10 +575,17 @@ export async function setup(store: Store, opts: SetupOptions): Promise<void> {
     fs.writeFileSync(plistPath, plist, { mode: 0o644 });
     execFileSync("/usr/bin/plutil", ["-lint", plistPath], { stdio: "ignore" });
     const uid = process.getuid?.() ?? 501;
-    spawnSync("/bin/launchctl", ["bootout", `gui/${uid}/${label}`], { stdio: "ignore" });
-    spawnSync("/bin/launchctl", ["enable", `gui/${uid}/${label}`], { stdio: "ignore" });
-    const boot = spawnSync("/bin/launchctl", ["bootstrap", `gui/${uid}`, plistPath], { encoding: "utf8" });
-    if (boot.status !== 0) throw new Error(`launchctl bootstrap failed: ${boot.stderr.trim()}`);
+    const loaded = await loadAgent(uid, label, plistPath);
+    if (!loaded.ok) {
+      // Never leave the Mac with no daemon: the agent that was there goes back and starts again.
+      if (previousPlist !== null) {
+        fs.writeFileSync(plistPath, previousPlist, { mode: 0o644 });
+        const back = await loadAgent(uid, label, plistPath);
+        throw new Error(`launchctl couldn't start the new daemon (${loaded.error}). ${back.ok ? "The one that was running before is back." : `Putting the one before back failed too (${back.error}); run ${cliName} doctor.`}`);
+      }
+      fs.rmSync(plistPath, { force: true });
+      throw new Error(`launchctl couldn't start the daemon (${loaded.error}). Nothing was installed; run ${cliName} setup again, or ${cliName} doctor.`);
+    }
     let up = false;
     for (let i = 0; i < 20 && !up; i++) {
       await new Promise((r) => setTimeout(r, 500));

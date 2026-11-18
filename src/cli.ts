@@ -2,10 +2,11 @@
 // phone, with its own P-256 key in the data directory, so every call takes
 // the same signed path the app does.
 //
-//   vm setup [--dry-run] [--no-tailscale] [--lan|--no-lan] [--wifi] [--projects <folder>]
+//   vm setup [--dry-run] [--no-tailscale] [--lan|--no-lan] [--wifi] [--projects <folder>] [--replace]
 //                                 install and start the daemon, print a pairing QR code; --projects
 //                                 says where your repos live (asked, if ~/dev has none); --wifi when
 //                                 the Mac has Tailscale and the phone doesn't
+//                                 --replace when this Mac's daemon runs from another copy
 //   vm restart [--when-idle]      restart the daemon, after a change to its .env; --when-idle waits
 //                                 until no turn is running
 //   vm doctor                     check Node, Claude Code's sign-in, the daemon, Tailscale, projects, pushes
@@ -212,7 +213,7 @@ async function main(): Promise<void> {
       const at = rest.indexOf("--projects");
       const projects = at >= 0 ? rest[at + 1] : undefined;
       if (at >= 0 && (!projects || projects.startsWith("--"))) throw new Error(`usage: ${cliName} setup --projects <folder>`);
-      await setup(store, { dryRun: rest.includes("--dry-run"), tailscale: !rest.includes("--no-tailscale"), ...(rest.includes("--lan") ? { lan: true } : rest.includes("--no-lan") ? { lan: false } : {}), ...(rest.includes("--wifi") ? { wifi: true } : {}), ...(projects ? { projects } : {}) });
+      await setup(store, { dryRun: rest.includes("--dry-run"), tailscale: !rest.includes("--no-tailscale"), ...(rest.includes("--lan") ? { lan: true } : rest.includes("--no-lan") ? { lan: false } : {}), ...(rest.includes("--wifi") ? { wifi: true } : {}), ...(projects ? { projects } : {}), ...(rest.includes("--replace") ? { replace: true } : {}) });
       return;
     }
     if (cmd === "restart") {

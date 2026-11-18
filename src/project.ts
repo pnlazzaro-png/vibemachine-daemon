@@ -192,6 +192,12 @@ export function detectedPreview(cwd: string, xcodeDerivedData = path.join(os.hom
   return { simulator: "iPhone Duo", bundleId: newest.id, app: newest.app, settleMs: 2500, clips: true, screens: [DETECTED_SCREEN], web: null };
 }
 
+/** The most a scan visits: folders walked, and apps found (each costs a `plutil`). A real repo
+ *  takes a few hundred folders; a huge or hostile tree stops here rather than holding the daemon,
+ *  whose streams and prompts wait while it walks (audit 11.13). */
+const SCAN_MAX_DIRS = 4000;
+const SCAN_MAX_APPS = 20;
+
 function scan(dir: string, xcodeDerivedData = path.join(os.homedir(), "Library/Developer/Xcode/DerivedData")): Scan {
   const cwd = path.resolve(dir);
   const hit = scans.get(cwd);
@@ -199,7 +205,9 @@ function scan(dir: string, xcodeDerivedData = path.join(os.homedir(), "Library/D
   const apps: string[] = [];
   const projects = new Set<string>();
   let spec = false;
+  let visited = 0;
   const walk = (dir: string, depth: number): void => {
+    if (++visited > SCAN_MAX_DIRS || apps.length >= SCAN_MAX_APPS) return;
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -211,7 +219,7 @@ function scan(dir: string, xcodeDerivedData = path.join(os.homedir(), "Library/D
       if (depth <= 2 && e.isFile() && e.name === "project.yml") spec = true;
       if (!e.isDirectory()) continue;
       if (products) {
-        if (isAppBundle(e.name)) apps.push(path.join(dir, e.name));
+        if (isAppBundle(e.name) && apps.length < SCAN_MAX_APPS) apps.push(path.join(dir, e.name));
         continue;
       }
       if (depth <= 2 && /\.(xcodeproj|xcworkspace)$/.test(e.name)) projects.add(e.name.replace(/\.(xcodeproj|xcworkspace)$/, ""));
@@ -242,7 +250,7 @@ function scan(dir: string, xcodeDerivedData = path.join(os.homedir(), "Library/D
       }
       for (const c of configs) {
         try {
-          for (const a of fs.readdirSync(path.join(productsDir, c))) if (isAppBundle(a)) apps.push(path.join(productsDir, c, a));
+          for (const a of fs.readdirSync(path.join(productsDir, c))) if (isAppBundle(a) && apps.length < SCAN_MAX_APPS) apps.push(path.join(productsDir, c, a));
         } catch {
           /* gone since */
         }

@@ -104,6 +104,40 @@ export function callerKey(address: string): string {
   return groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, "")).join(":") + "::/64";
 }
 
+/** The network a caller is on, for a second, wider limit: an IPv6 address's /48 (a site's whole
+ *  allocation, which a /64 limit alone lets one customer split 65,536 ways); an IPv4 address itself. */
+export function networkKey(address: string): string {
+  const k = callerKey(address);
+  if (!k.endsWith("::/64")) return k;
+  return k.replace(/::\/64$/, "").split(":").slice(0, 3).join(":") + "::/48";
+}
+
+/** A bounded memory of keys for a while, with a value each; the oldest go first past `max`. */
+export class Remembered<V> {
+  private items = new Map<string, { value: V; at: number }>();
+  constructor(private readonly keepMs: number, private readonly max = 100_000) {}
+
+  get(key: string, now = Date.now()): V | undefined {
+    const item = this.items.get(key);
+    if (!item) return undefined;
+    if (now - item.at >= this.keepMs) {
+      this.items.delete(key);
+      return undefined;
+    }
+    return item.value;
+  }
+
+  set(key: string, value: V, now = Date.now()): void {
+    this.items.delete(key);
+    this.items.set(key, { value, at: now });
+    while (this.items.size > this.max) this.items.delete(this.items.keys().next().value!);
+  }
+
+  get size(): number {
+    return this.items.size;
+  }
+}
+
 export interface RelayOptions {
   /** The header a trusted proxy sets with the caller's address (lower-case), e.g. `fly-client-ip`; none: the socket's address. */
   clientHeader?: string;
@@ -111,15 +145,24 @@ export interface RelayOptions {
   /** Per caller (address, or its /64) and per device token, each a minute's worth. */
   perCaller?: number;
   perToken?: number;
-  /** Every caller together, a minute's worth: what the relay will ever ask of Apple. */
+  /** Pushes to tokens Apple hasn't accepted from this relay yet, every caller together, a minute's
+   *  worth. A token Apple has taken goes outside it (only its own limit applies), so a flood of
+   *  made-up tokens fills this and nothing else: real phones keep getting their pushes (audit 11.3). */
   overall?: number;
+  /** Per network (an IPv6 /48, or an IPv4 address), a minute's worth. */
+  perNetwork?: number;
 }
 
 export function createRelay(opts: RelayOptions = {}): http.Server {
   const transport = opts.transport ?? http2Transport;
   const callers = new RateLimit(opts.perCaller ?? 120, 60_000);
+  const networks = new RateLimit(opts.perNetwork ?? 600, 60_000);
   const tokens = new RateLimit(opts.perToken ?? 30, 60_000);
-  const overall = new RateLimit(opts.overall ?? 3000, 60_000);
+  const overall = new RateLimit(opts.overall ?? 600, 60_000);
+  // Tokens Apple has accepted (a month), and ones it refused (an hour, its answer kept): a refused
+  // token isn't sent to Apple again meanwhile, so made-up tokens cost Apple one try each at most.
+  const proven = new Remembered<true>(30 * 24 * 60 * 60_000);
+  const refused = new Remembered<{ status: number; reason?: string }>(60 * 60_000);
   const clientHeader = (opts.clientHeader ?? process.env.RELAY_CLIENT_HEADER ?? "").trim().toLowerCase() || null;
   const reply = (res: http.ServerResponse, status: number, body: unknown) => {
     res.writeHead(status, { "content-type": "application/json" });
@@ -132,7 +175,7 @@ export function createRelay(opts: RelayOptions = {}): http.Server {
     // Behind a proxy the socket is the proxy's; only a header the proxy itself sets names the caller.
     const forwarded = clientHeader ? String(req.headers[clientHeader] ?? "").split(",")[0]!.trim() : "";
     const caller = callerKey(forwarded || req.socket.remoteAddress || "?");
-    if (!callers.allow(caller)) return reply(res, 429, { error: "slow down" });
+    if (!networks.allow(networkKey(forwarded || req.socket.remoteAddress || "?")) || !callers.allow(caller)) return reply(res, 429, { error: "slow down" });
     let size = 0;
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => {
@@ -149,8 +192,11 @@ export function createRelay(opts: RelayOptions = {}): http.Server {
       }
       const r = parseRelayRequest(body);
       if ("error" in r) return reply(res, 400, r);
+      const known = `${r.environment}:${r.token}`;
+      const no = refused.get(known);
+      if (no) return reply(res, 200, { ok: false, status: no.status, ...(no.reason ? { reason: no.reason } : {}) });
       if (!tokens.allow(r.token)) return reply(res, 429, { error: "slow down" });
-      if (!overall.allow("all")) return reply(res, 429, { error: "the relay is busy; try again in a minute" });
+      if (!proven.get(known) && !overall.allow("all")) return reply(res, 429, { error: "the relay is busy; try again in a minute" });
       if (!apnsConfigured()) return reply(res, 503, { error: "the relay has no APNs key" });
       let headers: Record<string, string>;
       try {
@@ -159,6 +205,10 @@ export function createRelay(opts: RelayOptions = {}): http.Server {
         return reply(res, 503, { error: err instanceof Error ? err.message : String(err) });
       }
       const sent = await transport({ host: HOSTS[r.environment], token: r.token, headers, payload: r.payload }).catch((err: unknown) => ({ status: 0, reason: err instanceof Error ? err.message : String(err) }));
+      if (sent.status === 200) proven.set(known, true);
+      else if (sent.status === 410 || (sent.status === 400 && /BadDeviceToken|DeviceTokenNotForTopic/.test(sent.reason ?? ""))) {
+        refused.set(known, { status: sent.status, ...(sent.reason ? { reason: sent.reason } : {}) });
+      }
       reply(res, 200, { ok: sent.status === 200, status: sent.status, ...(sent.reason ? { reason: sent.reason } : {}) });
     });
   });

