@@ -188,9 +188,15 @@ export async function printPairing(store: Store, target: { address: string; fing
   console.log("");
   console.log("Scan this with the iPhone's Camera, or with Scan on Vibe Machine's pairing screen:");
   await printQr(link);
-  console.log(`  Server:        ${target.address}`);
-  console.log(`  Pairing code:  ${code}  (valid ${config.pairingMinutes} minutes; \`vibemachine pair\` prints another)`);
-  if (target.fingerprint) console.log(`  Certificate:   ${target.fingerprint.slice(0, 16)}… (the phone pins it from the QR code)`);
+  if (target.fingerprint) {
+    // On the Wi-Fi only the scan works: the phone takes this Mac's certificate from the QR code, and a
+    // typed address and code have none, so they aren't offered (audit S12).
+    console.log(`  Valid ${config.pairingMinutes} minutes; \`vibemachine pair\` prints another. On the Wi-Fi the code has to be scanned:`);
+    console.log(`  it carries this Mac's certificate (${target.fingerprint.slice(0, 16)}…), which the phone pins.`);
+  } else {
+    console.log(`  Server:        ${target.address}`);
+    console.log(`  Pairing code:  ${code}  (valid ${config.pairingMinutes} minutes; \`vibemachine pair\` prints another)`);
+  }
   if (target.note) console.log(`  ${target.note}`);
   if (target.address.startsWith("http://127.")) console.log("  The phone can't reach 127.0.0.1: run `vibemachine setup --lan`, or install Tailscale on both and run `vibemachine setup` again.");
 }
@@ -384,7 +390,10 @@ export async function doctor(store: Store): Promise<Check[]> {
     optional: true,
     what: "Pushes",
     found: apns ? `APNs key ${config.apns.keyId}` : !config.pushRelay ? "off (no APNs key, no PUSH_RELAY)" : relay ? `through the relay at ${config.pushRelay}` : `the relay at ${config.pushRelay} isn't answering`,
-    fix: "permission prompts, turn ends and the build Live Activity reach the phone only while the app is open; set PUSH_RELAY in .env (or an APNs key) to turn pushes on",
+    // Until the relay is open there is no address to give (audit S7): say so, not "set PUSH_RELAY".
+    fix: config.pushRelay
+      ? "permission prompts, turn ends and the Live Activity reach the phone only while the app is open, until the relay answers again"
+      : "permission prompts, turn ends and the Live Activity reach the phone only while the app is open. The Vibe Machine push relay isn't open yet; when it is, `vibemachine update` turns pushes on with nothing to set",
   });
   const simctl = run("/usr/bin/xcrun", ["simctl", "help"], 10_000).ok;
   checks.push({ ok: simctl, optional: true, what: "Xcode", found: simctl ? "simctl available" : "no simctl", fix: "previews of iOS apps need Xcode and a booted simulator; web previews work without it" });

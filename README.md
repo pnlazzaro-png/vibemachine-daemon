@@ -20,7 +20,13 @@ sponsored by Anthropic. Claude and Claude Code are trademarks of Anthropic.
 
 ## What you need
 
-- A Mac with **Node 24 or newer** (`brew install node`, or nodejs.org).
+- A Mac with **Node 24 or newer**. `brew install node` is the easy way: with
+  the nodejs.org installer, `npm install -g` wants `sudo`, and the daemon
+  must be yours, not root's (`vibemachine` refuses to run as root).
+- A Mac that is awake. The daemon keeps it awake while a turn runs; between
+  turns a sleeping Mac doesn't answer the phone. On a desktop, turn on "Wake
+  for network access" (System Settings, Energy); a laptop with its lid shut
+  is asleep.
 - **Claude Code**, installed and signed in with your own account: run
   `claude` once in a terminal and sign in. The daemon runs that same,
   unmodified `claude`; it never sees, stores or forwards your credentials.
@@ -89,6 +95,10 @@ daemon without an APNs key of its own sends them through the Vibe Machine
 push relay (`PUSH_RELAY`), which adds Apple's signature and forwards each
 one immediately. It keeps nothing and logs nothing about them.
 `vibemachine doctor` says which way yours go.
+
+The relay isn't open yet. Until it is, a daemon without its own APNs key
+sends no pushes: prompts and turn ends show while the app is open, and there
+is no Live Activity. When it opens, `vibemachine update` turns them on.
 
 ## What it keeps, and where
 

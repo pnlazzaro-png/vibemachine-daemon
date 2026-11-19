@@ -219,6 +219,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       row = this.store.getSession(id)!;
     }
     if (!live || live.proc.exited) {
+      // A folder moved or deleted since: said as that, before a child is started in it (the spawn
+      // failed as "couldn't run claude … install Claude Code", and the Mac was kept awake for a
+      // turn that never ran).
+      if (!fs.existsSync(row.cwd)) throw new BadRequestError(`this session's folder is gone: ${row.cwd}`);
       live = await this.spawn(row, true);
     }
     const turn = row.turns + 1;
@@ -318,12 +322,19 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   /**
-   * The phone reported an activity's token for this session. If no turn is running, the turn it
-   * belongs to ended before the token came (a short one): the end is sent again so it lands.
+   * The phone reported an activity's token for this session. A turn still running sends where it is
+   * at once: the token can come late (the phone sends it again on connecting when the first try
+   * didn't land), and the card would otherwise sit on its first state until the next stage. If no
+   * turn is running, the turn it belongs to ended before the token came (a short one): the end is
+   * sent again so it lands.
    */
   activityTokenArrived(id: string): void {
     const live = this.live.get(id);
-    if (!live || live.activity) return;
+    if (!live) return;
+    if (live.activity) {
+      if (!live.activity.tracker.finished) this.emit("activity", { sessionId: id, event: "update", state: { ...live.activity.tracker.state }, urgent: true });
+      return;
+    }
     const end = live.lastActivityEnd ?? { state: { stage: "done", status: "stopped", tokens: 0, output: 0, startedAt: 0, lit: [], detail: "" }, dismissAt: new Date() };
     this.emit("activity", { sessionId: id, event: "end", ...end });
   }

@@ -144,6 +144,33 @@ function optionalString(body: Json, key: string): string | undefined {
   return typeof v === "string" && v.trim() ? v : undefined;
 }
 /** A setting the phone may change: a string sets it, null resets it, absent leaves it. */
+/**
+ * A file down the response. A read that fails part-way ends the response rather than the process,
+ * and a phone that goes away mid-download closes the file (it was left open, one descriptor a time).
+ */
+export function sendFile(file: string, res: http.ServerResponse): void {
+  const stream = fs.createReadStream(file);
+  stream.on("error", (err) => {
+    console.error(`sending ${path.basename(file)} failed:`, err.message);
+    res.destroy();
+  });
+  res.on("close", () => stream.destroy());
+  stream.pipe(res);
+}
+
+/** A model's name or alias as the CLI takes it on its argv: nothing that reads as a flag. */
+const MODEL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]*$/;
+
+/**
+ * `Content-Disposition` for a file's own name. A header carries Latin-1 only, and a name outside it
+ * (Japanese, the narrow space in a Mac screenshot's name) threw from `writeHead`: the plain name
+ * with those characters replaced, and the real one beside it in RFC 5987's form.
+ */
+export function inlineDisposition(name: string): string {
+  const plain = name.replace(/["\\\r\n]/g, "_").replace(/[^\x20-\x7e]/g, "_");
+  return `inline; filename="${plain}"; filename*=UTF-8''${encodeURIComponent(name).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)}`;
+}
+
 function settable(body: Json, key: string): string | null | undefined {
   if (!(key in body)) return undefined;
   const v = body[key];
@@ -246,7 +273,7 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
       if (!file.startsWith(dir) || !fs.existsSync(file)) throw new HttpError(404, "no such build");
       const types: Record<string, string> = { ".html": "text/html; charset=utf-8", ".plist": "application/xml", ".ipa": "application/octet-stream", ".png": "image/png" };
       res.writeHead(200, { "content-type": types[path.extname(name)] ?? "application/octet-stream", "content-length": fs.statSync(file).size });
-      fs.createReadStream(file).pipe(res);
+      sendFile(file, res);
       return;
     }
 
@@ -336,6 +363,7 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
         const sessionId = requireString(json, "session_id");
         if (!sessions.get(sessionId)) throw new HttpError(404, "no such session");
         store.setActivityToken(auth.deviceId!, sessionId, json.token.toLowerCase(), environmentFrom(json.environment));
+        console.log(`[${sessionId.slice(0, 8)}] Live Activity token from ${store.getDevice(auth.deviceId!)?.name ?? auth.deviceId}`);
         sessions.activityTokenArrived(sessionId);
       }
       return sendJson(res, 200, { ok: true });
@@ -347,7 +375,7 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
       const file = row ? clipPath(row.path) : "";
       if (!row || !fs.existsSync(file)) throw new HttpError(404, "no clip for that capture");
       res.writeHead(200, { "content-type": "video/mp4", "content-length": fs.statSync(file).size, "cache-control": "private, max-age=31536000, immutable" });
-      fs.createReadStream(file).pipe(res);
+      sendFile(file, res);
       return;
     }
 
@@ -366,7 +394,7 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
       }
       const stat = fs.statSync(file);
       res.writeHead(200, { "content-type": type, "content-length": stat.size, "cache-control": "private, max-age=31536000, immutable" });
-      fs.createReadStream(file).pipe(res);
+      sendFile(file, res);
       return;
     }
 
@@ -377,10 +405,10 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
       res.writeHead(200, {
         "content-type": row.media_type,
         "content-length": fs.statSync(row.path).size,
-        "content-disposition": `inline; filename="${row.name.replace(/["\\\r\n]/g, "_")}"`,
+        "content-disposition": inlineDisposition(row.name),
         "cache-control": "private, max-age=31536000, immutable",
       });
-      fs.createReadStream(row.path).pipe(res);
+      sendFile(row.path, res);
       return;
     }
 
@@ -391,7 +419,7 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
       const file = await poster(row.path);
       if (!file) throw new HttpError(404, "no poster for this video");
       res.writeHead(200, { "content-type": "image/jpeg", "content-length": fs.statSync(file).size, "cache-control": "private, max-age=31536000, immutable" });
-      fs.createReadStream(file).pipe(res);
+      sendFile(file, res);
       return;
     }
 
@@ -401,7 +429,7 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
       const mode = optionalString(json, "permission_mode");
       if (mode && !(PERMISSION_MODES as readonly string[]).includes(mode)) throw new HttpError(400, `permission_mode must be one of ${PERMISSION_MODES.join(", ")}`);
       const model = optionalString(json, "model");
-      if (model && !/^[A-Za-z0-9][A-Za-z0-9._:\[\]-]*$/.test(model)) throw new HttpError(400, "model must be a model name or alias");
+      if (model && !MODEL_NAME.test(model)) throw new HttpError(400, "model must be a model name or alias");
       const attachments = attachmentsOrThrow(json);
       const prompt = attachments.length > 0 ? (optionalString(json, "prompt") ?? "") : requireString(json, "prompt");
       const effort = effortOrThrow(optionalString(json, "effort"));
@@ -444,6 +472,8 @@ export function startServer(store: Store, sessions: SessionManager, ledger?: Usa
       }
       if (action === "settings") {
         const model = settable(json, "model");
+        // To the CLI's argv when the child is next started, as on `POST /sessions`.
+        if (model && !MODEL_NAME.test(model)) throw new HttpError(400, "model must be a model name or alias");
         const effort = effortOrThrow(settable(json, "effort"));
         const permissionMode = optionalString(json, "permission_mode");
         if (permissionMode && !(PERMISSION_MODES as readonly string[]).includes(permissionMode)) throw new HttpError(400, `permission_mode must be one of ${PERMISSION_MODES.join(", ")}`);

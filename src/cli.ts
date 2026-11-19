@@ -41,7 +41,7 @@ import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
 import { signingString } from "./auth.js";
-import { cliName, config } from "./config.js";
+import { cliName, config, packageVersion } from "./config.js";
 import { Store } from "./db.js";
 import { exportDemo } from "./demo.js";
 import { doctor, pairingTarget, printChecks, printPairing, restartDaemon, restartWhenIdle, setup, uninstall, update } from "./setup.js";
@@ -204,8 +204,30 @@ async function statsWithoutDaemon(args: string[]): Promise<void> {
   }
 }
 
+/** Every command and what it does, from the list at the top of this file (the author's own tool left out). */
+function usage(): string {
+  const lines = fs.readFileSync(new URL(import.meta.url), "utf8").split("\n").filter((l) => (l.startsWith("//   vm ") || l.startsWith(`//   ${cliName} `)) && !l.includes(" export-demo "));
+  return lines.map((l) => l.replace(/^\/\/   (vm )?/, (_m, vm: string | undefined) => (vm ? `${cliName} ` : ""))).join("\n");
+}
+
+const COMMANDS = ["setup", "restart", "update", "uninstall", "doctor", "pair", "devices", "forget", "sessions", "projects", "new", "say", "set", "pending", "allow", "deny", "interrupt", "archive", "unarchive", "preview", "stats", "export-demo", "tail"];
+
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
+  // Asking what this is writes nothing: no key, no database.
+  if (cmd === "--version" || cmd === "-v" || cmd === "version") return console.log(packageVersion);
+  if (cmd === undefined || cmd === "help" || cmd === "--help" || cmd === "-h") return console.log(`Vibe Machine daemon ${packageVersion}\n\n${usage()}`);
+  if (!COMMANDS.includes(cmd)) {
+    console.error(`${cliName}: no such command: ${cmd}\n\n${usage()}`);
+    process.exitCode = 1;
+    return;
+  }
+  // As root the data folder, the key and the LaunchAgent would be root's: the daemon is the user's own.
+  if (process.getuid?.() === 0) {
+    console.error(`Run ${cliName} without sudo: it sets up and talks to a daemon in your own account, and as root its files would belong to root.`);
+    process.exitCode = 1;
+    return;
+  }
   if (cmd === "stats" && !(await daemonAnswers())) return statsWithoutDaemon(rest);
   const store = new Store();
   try {
@@ -346,8 +368,6 @@ async function main(): Promise<void> {
       });
       return;
     }
-    const usage = fs.readFileSync(new URL(import.meta.url), "utf8").split("\n").filter((l) => l.startsWith("//   vm ") || l.startsWith(`//   ${cliName} `));
-    console.log(usage.map((l) => l.replace(/^\/\/   (vm )?/, (_m, vm: string | undefined) => (vm ? `${cliName} ` : ""))).join("\n"));
   } finally {
     try {
       store.close();
