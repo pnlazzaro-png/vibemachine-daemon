@@ -12,6 +12,12 @@ while [ -L "$self" ]; do
   case "$target" in /*) self="$target" ;; *) self="$(dirname "$self")/$target" ;; esac
 done
 root="$(cd "$(dirname "$self")/.." && pwd)"
+# Never as root, and said here before anything loads: the settings make the data folder as they
+# load, and one made under sudo is root's, which the next plain `vibemachine setup` can't write to.
+if [ "$(id -u)" = 0 ]; then
+  echo "Run vibemachine without sudo: it sets up and talks to a daemon in your own account, and as root its files would belong to root." >&2
+  exit 1
+fi
 # The first Node that is new enough, looking where installers put one before the shell's own PATH
 # (a version manager's default is often older than the Node Homebrew installed, and launchd's PATH
 # has no version manager on it at all).

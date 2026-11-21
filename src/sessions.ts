@@ -209,6 +209,11 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   async prompt(id: string, text: string, attachments: AttachmentInput[] = []): Promise<void> {
     let row = this.store.getSession(id);
     if (!row) throw new Error("no such session");
+    // A folder moved or deleted since: said as that, before a child is started in it (the spawn
+    // failed as "couldn't run claude … install Claude Code", and the Mac was kept awake for a
+    // turn that never ran), and before an archived session is put back in the list for nothing.
+    const running = this.live.get(id);
+    if ((!running || running.proc.exited) && !fs.existsSync(row.cwd)) throw new BadRequestError(`this session's folder is gone: ${row.cwd}`);
     // Another turn for an archived session (from `vm say`, say) puts it back in the list.
     if (row.archived_at) row = this.store.setArchived(id, false)!;
     let live = this.live.get(id);
@@ -219,10 +224,6 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       row = this.store.getSession(id)!;
     }
     if (!live || live.proc.exited) {
-      // A folder moved or deleted since: said as that, before a child is started in it (the spawn
-      // failed as "couldn't run claude … install Claude Code", and the Mac was kept awake for a
-      // turn that never ran).
-      if (!fs.existsSync(row.cwd)) throw new BadRequestError(`this session's folder is gone: ${row.cwd}`);
       live = await this.spawn(row, true);
     }
     const turn = row.turns + 1;
@@ -332,7 +333,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const live = this.live.get(id);
     if (!live) return;
     if (live.activity) {
-      if (!live.activity.tracker.finished) this.emit("activity", { sessionId: id, event: "update", state: { ...live.activity.tracker.state }, urgent: true });
+      // Not urgent: it goes to every phone with a card for this session, and a phone whose link
+      // flaps reports its token again each time; Apple budgets the urgent ones.
+      if (!live.activity.tracker.finished) this.emit("activity", { sessionId: id, event: "update", state: { ...live.activity.tracker.state }, urgent: false });
       return;
     }
     const end = live.lastActivityEnd ?? { state: { stage: "done", status: "stopped", tokens: 0, output: 0, startedAt: 0, lit: [], detail: "" }, dismissAt: new Date() };

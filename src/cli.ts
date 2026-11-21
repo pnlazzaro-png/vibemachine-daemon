@@ -214,7 +214,7 @@ const COMMANDS = ["setup", "restart", "update", "uninstall", "doctor", "pair", "
 
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
-  // Asking what this is writes nothing: no key, no database.
+  // Asking what this is writes no key and no database (the settings do make the empty data folder as they load).
   if (cmd === "--version" || cmd === "-v" || cmd === "version") return console.log(packageVersion);
   if (cmd === undefined || cmd === "help" || cmd === "--help" || cmd === "-h") return console.log(`Vibe Machine daemon ${packageVersion}\n\n${usage()}`);
   if (!COMMANDS.includes(cmd)) {
@@ -222,7 +222,10 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
+  // Help asked of a command is help, never the command: `uninstall --help` used to uninstall.
+  if (rest.includes("--help") || rest.includes("-h")) return console.log(`Vibe Machine daemon ${packageVersion}\n\n${usage()}`);
   // As root the data folder, the key and the LaunchAgent would be root's: the daemon is the user's own.
+  // (The launcher says so first, before the settings load; this is for a run that skips it.)
   if (process.getuid?.() === 0) {
     console.error(`Run ${cliName} without sudo: it sets up and talks to a daemon in your own account, and as root its files would belong to root.`);
     process.exitCode = 1;

@@ -33,6 +33,11 @@ test("--version, help and a typo write no key or database; a typo fails (audit S
   assert.match(help.stdout, new RegExp(`^Vibe Machine daemon ${version.replaceAll(".", "\\.")}`));
   assert.match(help.stdout, /vibemachine setup/);
   assert.doesNotMatch(help.stdout, /export-demo/);
+  // Help asked of a command is help: `uninstall --help` must not uninstall.
+  const asked = run("uninstall", "--help");
+  assert.equal(asked.status, 0);
+  assert.match(asked.stdout, /^Vibe Machine daemon/);
+  assert.doesNotMatch(asked.stdout + asked.stderr, /removed|unloaded|bootout/i);
   const typo = run("stup");
   assert.equal(typo.status, 1);
   assert.match(typo.stderr, /no such command: stup/);

@@ -436,7 +436,7 @@ export function plistDaemonRoot(plist: string): string | null {
 
 /**
  * Another copy of the daemon this Mac's LaunchAgent already runs, still on disk: `setup` from this
- * copy would stop it, point the agent here and lay a fresh .env over the one it reads (Pete,
+ * copy would stop it, point the agent here and lay a fresh .env over the one it reads (the author,
  * 2026-11-18: the npm package's setup took over the clone's install). Null when the agent is this
  * copy's, or there is none, or the copy it ran is gone.
  */
@@ -461,7 +461,7 @@ function agentLoaded(uid: number, label: string): boolean {
 
 /**
  * (Re)load the agent from its plist. `bootout` returns before launchd has let go of the old one, and a
- * `bootstrap` straight after fails with "5: Input/output error" (what left Pete's daemon down,
+ * `bootstrap` straight after fails with "5: Input/output error" (what left the author's daemon down,
  * 2026-11-18), so it waits for the old one to be gone, and tries the bootstrap a few times.
  */
 export async function loadAgent(uid: number, label: string, plistPath: string): Promise<{ ok: true } | { ok: false; error: string }> {
