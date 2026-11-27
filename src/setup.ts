@@ -389,11 +389,10 @@ export async function doctor(store: Store): Promise<Check[]> {
     ok: apns || relay === true,
     optional: true,
     what: "Pushes",
-    found: apns ? `APNs key ${config.apns.keyId}` : !config.pushRelay ? "off (no APNs key, no PUSH_RELAY)" : relay ? `through the relay at ${config.pushRelay}` : `the relay at ${config.pushRelay} isn't answering`,
-    // Until the relay is open there is no address to give (audit S7): say so, not "set PUSH_RELAY".
+    found: apns ? `APNs key ${config.apns.keyId}` : !config.pushRelay ? "off (no APNs key, and PUSH_RELAY is off)" : relay ? `through the relay at ${config.pushRelay}` : `the relay at ${config.pushRelay} isn't answering`,
     fix: config.pushRelay
       ? "permission prompts, turn ends and the Live Activity reach the phone only while the app is open, until the relay answers again"
-      : "permission prompts, turn ends and the Live Activity reach the phone only while the app is open. The Vibe Machine push relay isn't open yet; when it is, `vibemachine update` turns pushes on with nothing to set",
+      : "permission prompts, turn ends and the Live Activity reach the phone only while the app is open. Take PUSH_RELAY=off out of the .env to send them through the Vibe Machine push relay",
   });
   const simctl = run("/usr/bin/xcrun", ["simctl", "help"], 10_000).ok;
   checks.push({ ok: simctl, optional: true, what: "Xcode", found: simctl ? "simctl available" : "no simctl", fix: "previews of iOS apps need Xcode and a booted simulator; web previews work without it" });

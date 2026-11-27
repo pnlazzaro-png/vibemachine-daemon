@@ -28,6 +28,18 @@ function str(name: string, fallback: string): string {
   const v = process.env[name]?.trim();
   return v ? v : fallback;
 }
+/** The Vibe Machine push relay (fly.toml): it holds the app's APNs key, and keeps nothing it forwards. */
+export const PUBLIC_PUSH_RELAY = "https://vibemachine-relay.fly.dev";
+/**
+ * PUSH_RELAY as set: unset or empty is the public relay, "off" (or "none", "0", "false") is no
+ * relay, anything else is another relay's address. Under `node --test` unset is no relay, so a
+ * test never sends a made-up token to the real one.
+ */
+export function pushRelayFrom(value: string | undefined, testing = process.env.NODE_TEST_CONTEXT !== undefined): string {
+  const v = value?.trim() ?? "";
+  if (["off", "none", "0", "false", "no"].includes(v.toLowerCase())) return "";
+  return v || (testing ? "" : PUBLIC_PUSH_RELAY);
+}
 function num(name: string, fallback: number): number {
   const v = Number(process.env[name]);
   return Number.isFinite(v) && process.env[name] !== undefined ? v : fallback;
@@ -89,9 +101,9 @@ export const config = {
   /** Also serve the routes over HTTPS on the Wi-Fi (lan.ts), for a phone without Tailscale. */
   lan: ["1", "true", "yes"].includes((process.env.LAN ?? "").trim().toLowerCase()),
   lanPort: num("LAN_PORT", 3006),
-  /** Where pushes go without an APNs key of our own: a push relay (pushrelay.ts) that has one. Empty: none. */
-  pushRelay: str("PUSH_RELAY", ""),
-  /** APNs, token-based. Empty: no pushes, no Live Activity (unless PUSH_RELAY is set). */
+  /** Where pushes go without an APNs key of our own: a push relay (pushrelay.ts) that has one. "off": none. */
+  pushRelay: pushRelayFrom(process.env.PUSH_RELAY),
+  /** APNs, token-based. Empty: pushes go through PUSH_RELAY. */
   apns: {
     keyId: str("APNS_KEY_ID", ""),
     teamId: str("APNS_TEAM_ID", ""),

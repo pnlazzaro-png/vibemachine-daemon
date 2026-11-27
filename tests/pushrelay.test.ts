@@ -156,3 +156,15 @@ test("relay: made-up tokens can't use up a real phone's pushes, and a refused to
     server.close();
   }
 });
+
+test("PUSH_RELAY: unset is the public relay, off is none, and a test never gets the real one", async () => {
+  const { pushRelayFrom, PUBLIC_PUSH_RELAY, config } = await import("../src/config.js");
+  assert.equal(pushRelayFrom(undefined, false), PUBLIC_PUSH_RELAY);
+  assert.equal(pushRelayFrom("  ", false), PUBLIC_PUSH_RELAY);
+  for (const off of ["off", "OFF", "none", "0", "false", "no"]) assert.equal(pushRelayFrom(off, false), "");
+  assert.equal(pushRelayFrom(" https://relay.example ", false), "https://relay.example");
+  assert.equal(pushRelayFrom(undefined, true), "");
+  assert.equal(pushRelayFrom("https://relay.example", true), "https://relay.example");
+  // This run is under `node --test`: whatever else is set, not the real relay.
+  assert.notEqual(config.pushRelay, PUBLIC_PUSH_RELAY);
+});

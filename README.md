@@ -96,9 +96,13 @@ push relay (`PUSH_RELAY`), which adds Apple's signature and forwards each
 one immediately. It keeps nothing and logs nothing about them.
 `vibemachine doctor` says which way yours go.
 
-The relay isn't open yet. Until it is, a daemon without its own APNs key
-sends no pushes: prompts and turn ends show while the app is open, and there
-is no Live Activity. When it opens, `vibemachine update` turns them on.
+The relay is at `https://vibemachine-relay.fly.dev`, and a daemon uses it
+with nothing to set (from 0.1.6; `vibemachine update` on an older one). It
+receives the phone's push token and the notification's text, and nothing
+else about your sessions. To send no pushes at all, put `PUSH_RELAY=off` in
+the `.env`: prompts and turn ends then show only while the app is open, and
+there is no Live Activity. `PUSH_RELAY=<address>` uses a relay of your own
+(`npm run relay`, with your own APNs key).
 
 ## What it keeps, and where
 
